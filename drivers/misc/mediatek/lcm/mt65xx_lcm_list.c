@@ -200,6 +200,7 @@ extern LCM_DRIVER ili9806e_dsi_vdo_fwvga_drv;
 extern LCM_DRIVER kr076_ek79007_wsvga_dsi_vdo_lcm_drv;
 extern LCM_DRIVER rm72013_wxga_dsi_vdo_lcm_drv;
 extern LCM_DRIVER ota7291_wxga_dsi_vdo_lcm_drv;
+extern LCM_DRIVER ili6150_wsvga_lvds_giantplus_lcm_drv;
 
 LCM_DRIVER* lcm_driver_list[] = 
 {
@@ -915,6 +916,11 @@ LCM_DRIVER* lcm_driver_list[] =
 
 #if defined(A080EAN01_DSI_VDO)
 	&a080ean01_dsi_vdo_lcm_drv,
+#endif
+
+#if defined(ILI6150_WSVGA_LVDS_GIANTPLUS)
+
+        &ili6150_wsvga_lvds_giantplus_lcm_drv,
 #endif
 
 };
