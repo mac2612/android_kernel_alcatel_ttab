@@ -8,10 +8,10 @@
 
 /* Battery Temperature Protection */
 #define MTK_TEMPERATURE_RECHARGE_SUPPORT
-#define MAX_CHARGE_TEMPERATURE  55
-#define MAX_CHARGE_TEMPERATURE_MINUS_X_DEGREE	50 //47 Fixed to 50 degree for according to  standard
-#define MIN_CHARGE_TEMPERATURE  2
-#define MIN_CHARGE_TEMPERATURE_PLUS_X_DEGREE	4  //6 Fixed to 2 degree accoding to TCL standard
+#define MAX_CHARGE_TEMPERATURE  50
+#define MAX_CHARGE_TEMPERATURE_MINUS_X_DEGREE	47
+#define MIN_CHARGE_TEMPERATURE  0
+#define MIN_CHARGE_TEMPERATURE_PLUS_X_DEGREE	6
 #define MAX_LIMIT_CHARGE_TEMPERATURE    45
 #define MIN_LIMIT_CHARGE_TEMPERATURE    43
 /* [PLATFORM]-ADD-BEGIN by TCTSZ leo.guo, 06/09/2015,  BATTERY Notify for NTC*/
@@ -33,7 +33,8 @@
 #define USB_CHARGER_CURRENT_CONFIGURED		CHARGE_CURRENT_500_00_MA	// 500mA
 
 #define USB_CHARGER_CURRENT					CHARGE_CURRENT_500_00_MA	//500mA
-#define AC_CHARGER_CURRENT				    CHARGE_CURRENT_1200_00_MA
+//#define AC_CHARGER_CURRENT				    CHARGE_CURRENT_800_00_MA
+#define AC_CHARGER_CURRENT				    CHARGE_CURRENT_1350_00_MA //Barkly
 #define NON_STD_AC_CHARGER_CURRENT			CHARGE_CURRENT_500_00_MA
 #define CHARGING_HOST_CHARGER_CURRENT       CHARGE_CURRENT_650_00_MA
 #define APPLE_0_5A_CHARGER_CURRENT          CHARGE_CURRENT_500_00_MA
@@ -46,9 +47,7 @@
 #define BATTERY_AVERAGE_SIZE 	30
 
 /* charger error check */
-/* [PLATFORM]-Add-BEGIN by TCTSZ.leo.guo, 04/15/2015,  modify ntc temperature function */
 #define BAT_LOW_TEMP_PROTECT_ENABLE         // stop charging if temp < MIN_CHARGE_TEMPERATURE
-/* [PLATFORM]-Add-END by TCTSZ.leo.guo */
 #define V_CHARGER_ENABLE 0				// 1:ON , 0:OFF	
 #define V_CHARGER_MAX 6500				// 6.5 V
 #define V_CHARGER_MIN 4400				// 4.4 V
@@ -57,7 +56,8 @@
 #define ONEHUNDRED_PERCENT_TRACKING_TIME	10	// 10 second
 #define NPERCENT_TRACKING_TIME	   			20	// 20 second
 #define SYNC_TO_REAL_TRACKING_TIME  		60	// 60 second
-#define V_0PERCENT_TRACKING							3400 //3400mV
+//#define V_0PERCENT_TRACKING							3400 //3400mV
+#define V_0PERCENT_TRACKING					3500 //Barkly, 0% = 3500mV
 
 /* Battery Notify */
 #define BATTERY_NOTIFY_CASE_0001_VCHARGER
@@ -106,7 +106,7 @@
 #endif
 
 /* High battery support */
-#define HIGH_BATTERY_VOLTAGE_SUPPORT
+//#define HIGH_BATTERY_VOLTAGE_SUPPORT
 
 /* Disable Battery check for HQA */
 #ifdef MTK_DISABLE_POWER_ON_OFF_VOLTAGE_LIMITATION
@@ -114,20 +114,13 @@
 #endif
 
 
-//#define MTK_WIRELESS_CHARGER_SUPPORT 1
-/* [PLATFORM]-Add-BEGIN by TCTSZ.leo.guo, 04/15/2015,  modify ntc temperature function */
-#define MTK_BATTERY_PROTECT_FEATURE
-/* [PLATFORM]-Add-END by TCTSZ.leo.guo */
-/* Pump Express support (fast charging) */
-#ifdef CONFIG_MTK_PUMP_EXPRESS_SUPPORT
-#define TA_START_VCHR_TUNUNG_VOLTAGE	3400
-#define TA_CHARGING_CURRENT			    CHARGE_CURRENT_1500_00_MA
+/* TA support (fast charging) */
+//#define MTK_TA_CHARGER_SUPPORT
+#ifdef MTK_PUMP_EXPRESS_SUPPORT
+#define TA_CHARGING_CURRENT CHARGE_CURRENT_1500_00_MA
+#define TA_START_VCHR_TUNUNG_VOLTAGE	3500	// for isink blink issue
 #undef V_CHARGER_MAX
-#ifdef TA_9V_SUPPORT
-#define V_CHARGER_MAX 9500				// 9.5 V
-#else
 #define V_CHARGER_MAX 6000				// 6.0 V
 #endif
-#endif
-
+//#define MTK_WIRELESS_CHARGER_SUPPORT 1
 #endif /* _CUST_BAT_H_ */ 
