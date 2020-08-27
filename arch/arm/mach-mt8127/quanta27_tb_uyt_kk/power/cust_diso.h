@@ -1,7 +1,8 @@
 #ifndef _CUST_DISO_H_
 #define _CUST_DISO_H_
 
-#define MTK_AUXADC_IRQ_SUPPORT
+// Do we need this for epic? Unclear...
+//#define MTK_AUXADC_IRQ_SUPPORT
 
 #define MTK_LOAD_SWITCH_FPF3040
 //#define MTK_DISCRETE_SWITCH

@@ -13,28 +13,17 @@
 #define SOC_BY_SW_FG //oam
 #endif
 
-#define CUST_CAPACITY_OCV2CV_TRANSFORM
+// Set in ttab config, not sure if we need to set it for epic.
+//#define CUST_CAPACITY_OCV2CV_TRANSFORM
 //#define CONFIG_DIS_CHECK_BATTERY
 //#define FIXED_TBAT_25
 
 #if defined(CONFIG_MTK_BQ24296_SUPPORT) \
+    || defined(CONFIG_MTK_BQ24297_SUPPORT) \
     || defined(CONFIG_MTK_BQ24196_SUPPORT)
+
 #define BAT_VOL_USE_ISENSE
 #define SWCHR_POWER_PATH
-#endif
-
-#if defined(CONFIG_MTK_FAN5402_SUPPORT) \
-	 || defined(CONFIG_MTK_FAN5405_SUPPORT) \
-	  || defined(CONFIG_MTK_BQ24158_SUPPORT) \
-	   || defined(CONFIG_MTK_BQ24196_SUPPORT) \
-	    || defined(CONFIG_MTK_BQ24296_SUPPORT) \
-	     || defined(CONFIG_MTK_NCP1851_SUPPORT) \
-	      || defined(CONFIG_MTK_NCP1854_SUPPORT) \
-	       || defined(CONFIG_MTK_BQ24160_SUPPORT) \
-	        || defined(CONFIG_MTK_BQ24157_SUPPORT) \
-	         || defined(CONFIG_MTK_BQ24250_SUPPORT) \
-	          || defined(CONFIG_MTK_BQ24261_SUPPORT) 
-#define EXTERNAL_SWCHR_SUPPORT
 #endif
 
 /* ADC Channel Number */
@@ -51,6 +40,13 @@
 #define VBATTEMP_CHANNEL_NUMBER  3
 
 #else //6323
+
+//Barkly, fixes issue that battery capacity quickly increase from 1% to >49% after Android reboot(AC-in must be plugged)
+//It was caused by unstable BATSNS(BQ24196:SYS) voltage(read by get_hw_ocv()) with AC-in
+//So change it to ISENSE(BQ24196:BAT) pin, it is very closely to actual battery voltage(OCV), and more stable with AC-in.
+#ifdef CONFIG_MTK_BQ24196_SUPPORT
+#define BAT_VOL_USE_ISENSE
+#endif
 
 #define CUST_TABT_NUMBER 17
 #ifdef  BAT_VOL_USE_ISENSE
@@ -80,24 +76,26 @@
 #define FG_METER_RESISTANCE 	0
 
 /* Qmax for battery  */
-#define Q_MAX_POS_50	4060
-#define Q_MAX_POS_25	4060
-#define Q_MAX_POS_0		3400
-#define Q_MAX_NEG_10	2950
+//Barkly, based on reference of battery vendor
+#define Q_MAX_POS_50	3230 //3009
+#define Q_MAX_POS_25	3240 //3009
+#define Q_MAX_POS_0		3200 //3009
+#define Q_MAX_NEG_10	3200 //3009
 
-#define Q_MAX_POS_50_H_CURRENT  4000
-#define Q_MAX_POS_25_H_CURRENT	4020
-#define Q_MAX_POS_0_H_CURRENT	2760
-#define Q_MAX_NEG_10_H_CURRENT	2450
+#define Q_MAX_POS_50_H_CURRENT  3230 //2975
+#define Q_MAX_POS_25_H_CURRENT	3250 //2975
+#define Q_MAX_POS_0_H_CURRENT	3210 //2975
+#define Q_MAX_NEG_10_H_CURRENT	3210 //2975
 
-/*[BUGFIX]-Add-BEGIN by TCTSZ.pingao.yang, 4/15/2015,  pr-975290,  change fg integration way */
+
 /* Discharge Percentage */
-#define OAM_D5		 0		//  1 : D5,   0: D2
-/*[BUGFIX]-Add-end by TCTSZ.pingao.yang, 4/15/2015*/
+//#define OAM_D5		 1		//  1 : D5,   0: D2
+#define OAM_D2		 1		//Barkly, 3240 mAh battery
+
 
 /* battery meter parameter */
 #define CUST_TRACKING_POINT  14
-#define CUST_R_SENSE         62  //Fixed sensor resistor according to HW designed.
+#define CUST_R_SENSE         200
 #define CUST_HW_CC 		    0
 #define AGING_TUNING_VALUE   100
 #define CUST_R_FG_OFFSET    23
@@ -114,10 +112,13 @@
 #define FG_VBAT_AVERAGE_SIZE 18
 #define R_FG_VALUE 			20 // mOhm, base is 20
 
-#define CUST_POWERON_DELTA_CAPACITY_TOLRANCE	60
+//#define CUST_POWERON_DELTA_CAPACITY_TOLRANCE	40
+#define CUST_POWERON_DELTA_CAPACITY_TOLRANCE	50 //Barkly, from MTK
 #define CUST_POWERON_LOW_CAPACITY_TOLRANCE		5
-#define CUST_POWERON_MAX_VBAT_TOLRANCE			70
-#define CUST_POWERON_DELTA_VBAT_TOLRANCE		60
+#define CUST_POWERON_MAX_VBAT_TOLRANCE			90
+
+//#define CUST_POWERON_DELTA_VBAT_TOLRANCE		65
+#define CUST_POWERON_DELTA_VBAT_TOLRANCE		50 //Barkly, from MTK
 
 /* Disable Battery check for HQA */
 #ifdef MTK_DISABLE_POWER_ON_OFF_VOLTAGE_LIMITATION
@@ -127,18 +128,8 @@
 /* Dynamic change wake up period of battery thread when suspend*/
 #define VBAT_NORMAL_WAKEUP		3600		//3.6V
 #define VBAT_LOW_POWER_WAKEUP		3500		//3.5v
-#define NORMAL_WAKEUP_PERIOD		5400 		//90 * 60 = 90 min
+#define NORMAL_WAKEUP_PERIOD		1800 		//30 * 60 = 30 min
 #define LOW_POWER_WAKEUP_PERIOD		300		//5 * 60 = 5 min
 #define CLOSE_POWEROFF_WAKEUP_PERIOD	30	//30 s
-
-/*[BUGFIX]-Add-BEGIN by TCTSZ.pingao.yang, 4/15/2015,  */
-#define MAX_SUSPEND_CURRENT 420 // 42 mA
-#define MIN_SUSPEND_CURRENT 0  // 0 mA
-#define DEFAUL_SUSPEND_CURRENT 120 //12mA
-#define SUSPEND_CURRENT_SETP 30 //3mA
-#define SLEEP_AFTER_FG_DIFF 3	// diff about 3%
-#define UI_REDUCE_CURRENT 180 //18mA
-#define SLEEP_REDUCE_CURRENT 60 //6mA
-/*[BUGFIX]-Add-END by TCTSZ.pingao.yang */
 
 #endif	//#ifndef _CUST_BATTERY_METER_H
