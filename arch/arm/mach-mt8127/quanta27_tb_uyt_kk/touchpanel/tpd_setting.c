@@ -1,7 +1,7 @@
 #include "tpd.h"
 
-int TPD_RES_X = 480;
-int TPD_RES_Y = 800;
+int TPD_RES_X = 1024;
+int TPD_RES_Y = 600;
 
 //#if (defined(TPD_HAVE_CALIBRATION) && !defined(TPD_CUSTOM_CALIBRATION))
 int tpd_calmat[8]     = {0};
