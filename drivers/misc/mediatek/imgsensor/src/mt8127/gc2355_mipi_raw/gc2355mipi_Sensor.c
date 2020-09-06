@@ -1,35 +1,7 @@
-/*****************************************************************************
- *
- * Filename:
- * ---------
- *   sensor.c
- *
- * Project:
- * --------
- *   RAW
- *
- * Description:
- * ------------
- *   Source code of Sensor driver
- *
- *
- * Author:
- * -------
- *   Leo Lee
- *
- *============================================================================
- *             HISTORY
- *------------------------------------------------------------------------------
- * $Revision:$
- * $Modtime:$
- * $Log:$
- *
- * 04 10  2013
- * First release MT6589 GC2355MIPI driver Version 1.0
- *
- *------------------------------------------------------------------------------
- *============================================================================
- ****************************************************************************/
+/*******************************************************************************************/
+
+
+/*******************************************************************************************/
 
 #include <linux/videodev2.h>
 #include <linux/i2c.h>
@@ -39,6 +11,13 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <asm/atomic.h>
+#include <linux/xlog.h>
+#include <asm/system.h>
+
+#include <linux/proc_fs.h> 
+
+
+#include <linux/dma-mapping.h>
 
 #include "kd_camera_hw.h"
 #include "kd_imgsensor.h"
@@ -48,67 +27,44 @@
 #include "gc2355mipi_Sensor.h"
 #include "gc2355mipi_Camera_Sensor_para.h"
 #include "gc2355mipi_CameraCustomized.h"
+static DEFINE_SPINLOCK(gc2355mipiraw_drv_lock);
 
-#ifdef GC2355MIPI_DEBUG
-#define SENSORDB printk
+#define GC2355_DEBUG
+//#define GC2355_DEBUG_SOFIA
+#define GC2355_TEST_PATTERN_CHECKSUM (0x9d1c9dad)//(0x5593c632)
+
+#ifdef GC2355_DEBUG
+	#define GC2355DB(fmt, arg...) xlog_printk(ANDROID_LOG_DEBUG, "[GC2355Raw] ",  fmt, ##arg)
 #else
-#define SENSORDB(x,...)
+	#define GC2355DB(fmt, arg...)
 #endif
 
-#define GC2355MIPI_2Lane   //MIPI Lane NUM
-
-#if defined(MT6577)||defined(MT6589)
-static DEFINE_SPINLOCK(gc2355mipi_drv_lock);
+#ifdef GC2355_DEBUG_SOFIA
+	#define GC2355DBSOFIA(fmt, arg...) xlog_printk(ANDROID_LOG_DEBUG, "[GC2355Raw] ",  fmt, ##arg)
+#else
+	#define GC2355DBSOFIA(fmt, arg...)
 #endif
-//static kal_uint16 Half_iShutter=0;
-static kal_bool b_Enable_Half = false;
+
+#define mDELAY(ms)  mdelay(ms)
+
+kal_uint32 GC2355_FeatureControl_PERIOD_PixelNum=GC2355_PV_PERIOD_PIXEL_NUMS;
+kal_uint32 GC2355_FeatureControl_PERIOD_LineNum=GC2355_PV_PERIOD_LINE_NUMS;
+UINT16  gc2355VIDEO_MODE_TARGET_FPS = 30;
+MSDK_SENSOR_CONFIG_STRUCT GC2355SensorConfigData;
+MSDK_SCENARIO_ID_ENUM GC2355CurrentScenarioId = MSDK_SCENARIO_ID_CAMERA_PREVIEW;
+
+/* FIXME: old factors and DIDNOT use now. s*/
+SENSOR_REG_STRUCT GC2355SensorCCT[]=CAMERA_SENSOR_CCT_DEFAULT_VALUE;
+SENSOR_REG_STRUCT GC2355SensorReg[ENGINEER_END]=CAMERA_SENSOR_REG_DEFAULT_VALUE;
+/* FIXME: old factors and DIDNOT use now. e*/
+
+static GC2355_PARA_STRUCT gc2355;
+
+#define Sleep(ms) mdelay(ms)
+#define GC2355_ORIENTATION IMAGE_NORMAL //IMAGE_NORMAL//IMAGE_HV_MIRROR
+
 extern int iReadRegI2C(u8 *a_pSendData , u16 a_sizeSendData, u8 * a_pRecvData, u16 a_sizeRecvData, u16 i2cId);
 extern int iWriteRegI2C(u8 *a_pSendData , u16 a_sizeSendData, u16 i2cId);
-
-/* SZ TCT xuejian.zhong add for CTS test*/
-static void GC2355GetAFMaxNumFocusAreas(UINT32 *pFeatureReturnPara32)
-{	
-    *pFeatureReturnPara32 = 0;    
-   // SENSORDB("OV2680GetAFMaxNumFocusAreas *pFeatureReturnPara32 = %d¬•n",  *pFeatureReturnPara32);
-}
-
-static void GC2355GetAEMaxNumMeteringAreas(UINT32 *pFeatureReturnPara32)
-{     
-    *pFeatureReturnPara32 = 0;    
-   // SENSORDB("OV2680GetAEMaxNumMeteringAreas *pFeatureReturnPara32 = %d¬•n",  *pFeatureReturnPara32);	
-}
-
-static void GC2355GetExifInfo(UINT32 exifAddr)
-{
-    SENSOR_EXIF_INFO_STRUCT* pExifInfo = (SENSOR_EXIF_INFO_STRUCT*)exifAddr;
-    pExifInfo->FNumber = 28;
-    pExifInfo->AEISOSpeed = AE_ISO_100;
-    pExifInfo->AWBMode = AWB_MODE_AUTO;
-    pExifInfo->CapExposureTime = 0;
-    pExifInfo->FlashLightTimeus = 0;
-    pExifInfo->RealISOValue = AE_ISO_100;
-}
-
-/* SZ TCT xuejian.zhong  end */
-
-
-
-static GC2355MIPI_sensor_struct GC2355MIPI_sensor =
-{
-	.eng_info =
-	{
-		.SensorId = 128,
-		.SensorType = CMOS_SENSOR,
-		.SensorOutputDataFormat = GC2355MIPI_COLOR_FORMAT,
-	},
-	.Mirror = GC2355MIPI_IMAGE_H_MIRROR,
-	.shutter = 0x20,  
-	.gain = 0x20,
-	.pclk = GC2355MIPI_PREVIEW_CLK,
-	.frame_height = GC2355MIPI_PV_PERIOD_LINE_NUMS,
-	.line_length = GC2355MIPI_PV_PERIOD_PIXEL_NUMS,
-};
-
 
 /*************************************************************************
 * FUNCTION
@@ -121,20 +77,20 @@ static GC2355MIPI_sensor_struct GC2355MIPI_sensor =
 *    addr: the 16bit address of register
 *    para: the 8bit value of register
 *
-* RETURNS 
+* RETURNS
 *    None
 *
 * LOCAL AFFECTED
 *
 *************************************************************************/
-static void GC2355MIPI_write_cmos_sensor(kal_uint8 addr, kal_uint8 para)
+static void GC2355_write_cmos_sensor(kal_uint8 addr, kal_uint8 para)
 {
 kal_uint8 out_buff[2];
 
     out_buff[0] = addr;
     out_buff[1] = para;
 
-    iWriteRegI2C((u8*)out_buff , (u16)sizeof(out_buff), GC2355MIPI_WRITE_ID); 
+    iWriteRegI2C((u8*)out_buff , 2, GC2355MIPI_WRITE_ID); 
 }
 
 /*************************************************************************
@@ -153,1152 +109,1077 @@ kal_uint8 out_buff[2];
 * LOCAL AFFECTED
 *
 *************************************************************************/
-static kal_uint8 GC2355MIPI_read_cmos_sensor(kal_uint8 addr)
+static kal_uint8 GC2355_read_cmos_sensor(kal_uint8 addr)
 {
   kal_uint8 in_buff[1] = {0xFF};
   kal_uint8 out_buff[1];
   
   out_buff[0] = addr;
 
-    if (0 != iReadRegI2C((u8*)out_buff , (u16) sizeof(out_buff), (u8*)in_buff, (u16) sizeof(in_buff), GC2355MIPI_WRITE_ID)) {
-        SENSORDB("ERROR: GC2355MIPI_read_cmos_sensor \n");
+    if (0 != iReadRegI2C((u8*)out_buff , 1, (u8*)in_buff, 1, GC2355MIPI_WRITE_ID)) {
+        GC2355DB("ERROR: GC2355MIPI_read_cmos_sensor \n");
     }
   return in_buff[0];
 }
 
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPI_SetShutter
-*
-* DESCRIPTION
-*	This function set e-shutter of GC2355MIPI to change exposure time.
-*
-* PARAMETERS
-*   iShutter : exposured lines
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-void GC2355MIPI_set_shutter(kal_uint16 iShutter)
+
+void GC2355_SetGain(UINT16 iGain)
 {
-#if defined(MT6577)||defined(MT6589)
-	spin_lock(&gc2355mipi_drv_lock);
-#endif
-	GC2355MIPI_sensor.shutter = iShutter;
-#if defined(MT6577)||defined(MT6589)
-	spin_unlock(&gc2355mipi_drv_lock);
-#endif
 
-	if (!iShutter) iShutter = 1; /* avoid 0 */
-	
-#ifdef GC2355MIPI_DRIVER_TRACE
-	SENSORDB("GC2355MIPI_set_shutter iShutter = %d \n",iShutter);
-#endif
-	if(iShutter < 7) iShutter = 7;
-	if(iShutter > 16383) iShutter = 16383;//2^14
-	//Update Shutter
-	GC2355MIPI_write_cmos_sensor(0x04, (iShutter) & 0xFF);
-	GC2355MIPI_write_cmos_sensor(0x03, (iShutter >> 8) & 0x3F);	
-}   /*  Set_GC2355MIPI_Shutter */
-
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPI_SetGain
-*
-* DESCRIPTION
-*	This function is to set global gain to sensor.
-*
-* PARAMETERS
-*   iGain : sensor global gain(base: 0x40)
-*
-* RETURNS 
-*	the actually gain set to sensor.
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
 #define ANALOG_GAIN_1 64  // 1.00x
-#define ANALOG_GAIN_2 88  // 1.375x
-#define ANALOG_GAIN_3 122  // 1.90x
-#define ANALOG_GAIN_4 168  // 2.625x
-#define ANALOG_GAIN_5 239  // 3.738x
-#define ANALOG_GAIN_6 330  // 5.163x
-#define ANALOG_GAIN_7 470  // 7.350x
+#define ANALOG_GAIN_2 88  //1.37x
+#define ANALOG_GAIN_3 121  // 1.89x
+#define ANALOG_GAIN_4 168  // 2.59x
+#define ANALOG_GAIN_5 239  // 3.70x
+#define ANALOG_GAIN_6 330  // 5.06x
+#define ANALOG_GAIN_7 470  // 7.15x
 
-kal_uint16  GC2355MIPI_SetGain(kal_uint16 iGain)
-{
-		kal_uint16 iReg,temp,temp1,luma_value;
+	kal_uint16 iReg,temp,temp1;
 		
-	#ifdef GC2355MIPI_DRIVER_TRACE
-	SENSORDB("GC2355MIPI_SetGain iGain = %d \n",iGain);
-	#endif
-	GC2355MIPI_write_cmos_sensor(0xb1, 0x01);
-	GC2355MIPI_write_cmos_sensor(0xb2, 0x00);
+	GC2355DB("GC2355MIPI_SetGain iGain = %d \n",iGain);
 
+	GC2355_write_cmos_sensor(0xb1, 0x01);
+	GC2355_write_cmos_sensor(0xb2, 0x00);
+	
 	iReg = iGain;
+	//digital gain
+	//GC2355MIPI_write_cmos_sensor(0xb1, iReg>>6);
+	//GC2355MIPI_write_cmos_sensor(0xb2, (iReg<<2)&0xfc);
+	
+	
 	if(iReg < 0x40)
 		iReg = 0x40;
+	if(iReg > 512)
+		iReg = 512;
+		
 	if((ANALOG_GAIN_1<= iReg)&&(iReg < ANALOG_GAIN_2))
 	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x00);// 
-		temp = iReg;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 1x , add pregain = %d\n",temp);
-	
+			//analog gain
+			GC2355_write_cmos_sensor(0xb6,	0x00);// 
+			temp = iReg;
+			GC2355_write_cmos_sensor(0xb1, temp>>6);
+			GC2355_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
+			GC2355DB("GC2355 analogic gain 1x , GC2355 add pregain = %d\n",temp);
+		
 	}
 	else if((ANALOG_GAIN_2<= iReg)&&(iReg < ANALOG_GAIN_3))
 	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x01);// 
-		temp = 64*iReg/ANALOG_GAIN_2;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 1.375x , add pregain = %d\n",temp);
+			//analog gain
+			GC2355_write_cmos_sensor(0xb6,	0x01);// 
+			temp = 64*iReg/ANALOG_GAIN_2;
+			GC2355_write_cmos_sensor(0xb1, temp>>6);
+			GC2355_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
+			GC2355DB("GC2355 analogic gain 1.45x , GC2355 add pregain = %d\n",temp);
+		
 	}
-
+	
 	else if((ANALOG_GAIN_3<= iReg)&&(iReg < ANALOG_GAIN_4))
 	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x02);//
-		temp = 64*iReg/ANALOG_GAIN_3;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 1.90x , add pregain = %d\n",temp);
+			//analog gain
+			GC2355_write_cmos_sensor(0xb6,	0x02);//
+			temp = 64*iReg/ANALOG_GAIN_3;
+			GC2355_write_cmos_sensor(0xb1, temp>>6);
+			GC2355_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
+			GC2355DB("GC2355 analogic gain 2.02x , GC2355 add pregain = %d\n",temp);	
 	}
-
-	else if(ANALOG_GAIN_4<= iReg)
-	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x03);//
-		temp = 64*iReg/ANALOG_GAIN_4;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 2.625x" , add pregain = %d\n",temp);
-	}
-/*	else if((ANALOG_GAIN_4<= iReg)&&(iReg < ANALOG_GAIN_5))
-	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x03);//
-		temp = 64*iReg/ANALOG_GAIN_4;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 2.625x , add pregain = %d\n",temp);
-	}
-
-	else if((ANALOG_GAIN_5<= iReg)&&(iReg)&&(iReg < ANALOG_GAIN_6))
-	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x04);//
-		temp = 64*iReg/ANALOG_GAIN_5;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 3.738x , add pregain = %d\n",temp);
-	}
-
-	else if((ANALOG_GAIN_6<= iReg)&&(iReg < ANALOG_GAIN_7))
-	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x05);//
-		temp = 64*iReg/ANALOG_GAIN_6;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 5.163x , add pregain = %d\n",temp);
-	}
-	else if(ANALOG_GAIN_7<= iReg)
-	{
-		//analog gain
-		GC2355MIPI_write_cmos_sensor(0xb6,  0x06);//
-		temp = 64*iReg/ANALOG_GAIN_7;
-		GC2355MIPI_write_cmos_sensor(0xb1, temp>>6);
-		GC2355MIPI_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
-		//SENSORDB("GC2355 analogic gain 7.350x" , add pregain = %d\n",temp);
-	}
-#endif*/
 	
-	return iGain;
-}
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPI_NightMode
-*
-* DESCRIPTION
-*	This function night mode of GC2355MIPI.
-*
-* PARAMETERS
-*	bEnable: KAL_TRUE -> enable night mode, otherwise, disable night mode
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-void GC2355MIPI_night_mode(kal_bool enable)
-{
-/*No Need to implement this function*/
-#if 0 
-	const kal_uint16 dummy_pixel = GC2355MIPI_sensor.line_length - GC2355MIPI_PV_PERIOD_PIXEL_NUMS;
-	const kal_uint16 pv_min_fps =  enable ? GC2355MIPI_sensor.night_fps : GC2355MIPI_sensor.normal_fps;
-	kal_uint16 dummy_line = GC2355MIPI_sensor.frame_height - GC2355MIPI_PV_PERIOD_LINE_NUMS;
-	kal_uint16 max_exposure_lines;
-	
-	printk("[GC2355MIPI_night_mode]enable=%d",enable);
-	if (!GC2355MIPI_sensor.video_mode) return;
-	max_exposure_lines = GC2355MIPI_sensor.pclk * GC2355MIPI_FPS(1) / (pv_min_fps * GC2355MIPI_sensor.line_length);
-	if (max_exposure_lines > GC2355MIPI_sensor.frame_height) /* fix max frame rate, AE table will fix min frame rate */
-//	{
-//	  dummy_line = max_exposure_lines - GC2355MIPI_PV_PERIOD_LINE_NUMS;
-//	}
-#endif
-}   /*  GC2355MIPI_NightMode    */
-
-
-/* write camera_para to sensor register */
-static void GC2355MIPI_camera_para_to_sensor(void)
-{
-  kal_uint32 i;
-#ifdef GC2355MIPI_DRIVER_TRACE
-	 SENSORDB("GC2355MIPI_camera_para_to_sensor\n");
-#endif
-  for (i = 0; 0xFFFFFFFF != GC2355MIPI_sensor.eng.reg[i].Addr; i++)
-  {
-    GC2355MIPI_write_cmos_sensor(GC2355MIPI_sensor.eng.reg[i].Addr, GC2355MIPI_sensor.eng.reg[i].Para);
-  }
-  for (i = GC2355MIPI_FACTORY_START_ADDR; 0xFFFFFFFF != GC2355MIPI_sensor.eng.reg[i].Addr; i++)
-  {
-    GC2355MIPI_write_cmos_sensor(GC2355MIPI_sensor.eng.reg[i].Addr, GC2355MIPI_sensor.eng.reg[i].Para);
-  }
-  GC2355MIPI_SetGain(GC2355MIPI_sensor.gain); /* update gain */
-}
-
-/* update camera_para from sensor register */
-static void GC2355MIPI_sensor_to_camera_para(void)
-{
-  kal_uint32 i,temp_data;
-#ifdef GC2355MIPI_DRIVER_TRACE
-   SENSORDB("GC2355MIPI_sensor_to_camera_para\n");
-#endif
-  for (i = 0; 0xFFFFFFFF != GC2355MIPI_sensor.eng.reg[i].Addr; i++)
-  {
-  	temp_data = GC2355MIPI_read_cmos_sensor(GC2355MIPI_sensor.eng.reg[i].Addr);
-#if defined(MT6577)||defined(MT6589)
-	spin_lock(&gc2355mipi_drv_lock);
-#endif
-    GC2355MIPI_sensor.eng.reg[i].Para = temp_data;
-#if defined(MT6577)||defined(MT6589)
-	spin_unlock(&gc2355mipi_drv_lock);
-#endif
-  }
-  for (i = GC2355MIPI_FACTORY_START_ADDR; 0xFFFFFFFF != GC2355MIPI_sensor.eng.reg[i].Addr; i++)
-  {
-  	temp_data = GC2355MIPI_read_cmos_sensor(GC2355MIPI_sensor.eng.reg[i].Addr);
-#if defined(MT6577)||defined(MT6589)
-	spin_lock(&gc2355mipi_drv_lock);
-#endif
-    GC2355MIPI_sensor.eng.reg[i].Para = temp_data;
-#if defined(MT6577)||defined(MT6589)
-	spin_unlock(&gc2355mipi_drv_lock);
-#endif
-  }
-}
-
-/* ------------------------ Engineer mode ------------------------ */
-inline static void GC2355MIPI_get_sensor_group_count(kal_int32 *sensor_count_ptr)
-{
-#ifdef GC2355MIPI_DRIVER_TRACE
-   SENSORDB("GC2355MIPI_get_sensor_group_count\n");
-#endif
-  *sensor_count_ptr = GC2355MIPI_GROUP_TOTAL_NUMS;
-}
-
-inline static void GC2355MIPI_get_sensor_group_info(MSDK_SENSOR_GROUP_INFO_STRUCT *para)
-{
-#ifdef GC2355MIPI_DRIVER_TRACE
-   SENSORDB("GC2355MIPI_get_sensor_group_info\n");
-#endif
-  switch (para->GroupIdx)
-  {
-  case GC2355MIPI_PRE_GAIN:
-    sprintf(para->GroupNamePtr, "CCT");
-    para->ItemCount = 5;
-    break;
-  case GC2355MIPI_CMMCLK_CURRENT:
-    sprintf(para->GroupNamePtr, "CMMCLK Current");
-    para->ItemCount = 1;
-    break;
-  case GC2355MIPI_FRAME_RATE_LIMITATION:
-    sprintf(para->GroupNamePtr, "Frame Rate Limitation");
-    para->ItemCount = 2;
-    break;
-  case GC2355MIPI_REGISTER_EDITOR:
-    sprintf(para->GroupNamePtr, "Register Editor");
-    para->ItemCount = 2;
-    break;
-  default:
-    ASSERT(0);
-  }
-}
-
-inline static void GC2355MIPI_get_sensor_item_info(MSDK_SENSOR_ITEM_INFO_STRUCT *para)
-{
-
-  const static kal_char *cct_item_name[] = {"SENSOR_BASEGAIN", "Pregain-R", "Pregain-Gr", "Pregain-Gb", "Pregain-B"};
-  const static kal_char *editer_item_name[] = {"REG addr", "REG value"};
-  
-#ifdef GC2355MIPI_DRIVER_TRACE
-	 SENSORDB("GC2355MIPI_get_sensor_item_info\n");
-#endif
-  switch (para->GroupIdx)
-  {
-  case GC2355MIPI_PRE_GAIN:
-    switch (para->ItemIdx)
-    {
-    case GC2355MIPI_SENSOR_BASEGAIN:
-    case GC2355MIPI_PRE_GAIN_R_INDEX:
-    case GC2355MIPI_PRE_GAIN_Gr_INDEX:
-    case GC2355MIPI_PRE_GAIN_Gb_INDEX:
-    case GC2355MIPI_PRE_GAIN_B_INDEX:
-      break;
-    default:
-      ASSERT(0);
-    }
-    sprintf(para->ItemNamePtr, cct_item_name[para->ItemIdx - GC2355MIPI_SENSOR_BASEGAIN]);
-    para->ItemValue = GC2355MIPI_sensor.eng.cct[para->ItemIdx].Para * 1000 / BASEGAIN;
-    para->IsTrueFalse = para->IsReadOnly = para->IsNeedRestart = KAL_FALSE;
-    para->Min = GC2355MIPI_MIN_ANALOG_GAIN * 1000;
-    para->Max = GC2355MIPI_MAX_ANALOG_GAIN * 1000;
-    break;
-  case GC2355MIPI_CMMCLK_CURRENT:
-    switch (para->ItemIdx)
-    {
-    case 0:
-      sprintf(para->ItemNamePtr, "Drv Cur[2,4,6,8]mA");
-      switch (GC2355MIPI_sensor.eng.reg[GC2355MIPI_CMMCLK_CURRENT_INDEX].Para)
-      {
-      case ISP_DRIVING_2MA:
-        para->ItemValue = 2;
-        break;
-      case ISP_DRIVING_4MA:
-        para->ItemValue = 4;
-        break;
-      case ISP_DRIVING_6MA:
-        para->ItemValue = 6;
-        break;
-      case ISP_DRIVING_8MA:
-        para->ItemValue = 8;
-        break;
-      default:
-        ASSERT(0);
-      }
-      para->IsTrueFalse = para->IsReadOnly = KAL_FALSE;
-      para->IsNeedRestart = KAL_TRUE;
-      para->Min = 2;
-      para->Max = 8;
-      break;
-    default:
-      ASSERT(0);
-    }
-    break;
-  case GC2355MIPI_FRAME_RATE_LIMITATION:
-    switch (para->ItemIdx)
-    {
-    case 0:
-      sprintf(para->ItemNamePtr, "Max Exposure Lines");
-      para->ItemValue = 5998;
-      break;
-    case 1:
-      sprintf(para->ItemNamePtr, "Min Frame Rate");
-      para->ItemValue = 5;
-      break;
-    default:
-      ASSERT(0);
-    }
-    para->IsTrueFalse = para->IsNeedRestart = KAL_FALSE;
-    para->IsReadOnly = KAL_TRUE;
-    para->Min = para->Max = 0;
-    break;
-  case GC2355MIPI_REGISTER_EDITOR:
-    switch (para->ItemIdx)
-    {
-    case 0:
-    case 1:
-      sprintf(para->ItemNamePtr, editer_item_name[para->ItemIdx]);
-      para->ItemValue = 0;
-      para->IsTrueFalse = para->IsReadOnly = para->IsNeedRestart = KAL_FALSE;
-      para->Min = 0;
-      para->Max = (para->ItemIdx == 0 ? 0xFFFF : 0xFF);
-      break;
-    default:
-      ASSERT(0);
-    }
-    break;
-  default:
-    ASSERT(0);
-  }
-}
-
-inline static kal_bool GC2355MIPI_set_sensor_item_info(MSDK_SENSOR_ITEM_INFO_STRUCT *para)
-{
-  kal_uint16 temp_para;
-#ifdef GC2355MIPI_DRIVER_TRACE
-   SENSORDB("GC2355MIPI_set_sensor_item_info\n");
-#endif
-  switch (para->GroupIdx)
-  {
-  case GC2355MIPI_PRE_GAIN:
-    switch (para->ItemIdx)
-    {
-    case GC2355MIPI_SENSOR_BASEGAIN:
-    case GC2355MIPI_PRE_GAIN_R_INDEX:
-    case GC2355MIPI_PRE_GAIN_Gr_INDEX:
-    case GC2355MIPI_PRE_GAIN_Gb_INDEX:
-    case GC2355MIPI_PRE_GAIN_B_INDEX:
-#if defined(MT6577)||defined(MT6589)
-		spin_lock(&gc2355mipi_drv_lock);
-#endif
-      GC2355MIPI_sensor.eng.cct[para->ItemIdx].Para = para->ItemValue * BASEGAIN / 1000;
-#if defined(MT6577)||defined(MT6589)
-	  spin_unlock(&gc2355mipi_drv_lock);
-#endif
-      GC2355MIPI_SetGain(GC2355MIPI_sensor.gain); /* update gain */
-      break;
-    default:
-      ASSERT(0);
-    }
-    break;
-  case GC2355MIPI_CMMCLK_CURRENT:
-    switch (para->ItemIdx)
-    {
-    case 0:
-      switch (para->ItemValue)
-      {
-      case 2:
-        temp_para = ISP_DRIVING_2MA;
-        break;
-      case 3:
-      case 4:
-        temp_para = ISP_DRIVING_4MA;
-        break;
-      case 5:
-      case 6:
-        temp_para = ISP_DRIVING_6MA;
-        break;
-      default:
-        temp_para = ISP_DRIVING_8MA;
-        break;
-      }
-      //GC2355MIPI_set_isp_driving_current(temp_para);
-#if defined(MT6577)||defined(MT6589)
-      spin_lock(&gc2355mipi_drv_lock);
-#endif
-      GC2355MIPI_sensor.eng.reg[GC2355MIPI_CMMCLK_CURRENT_INDEX].Para = temp_para;
-#if defined(MT6577)||defined(MT6589)
-	  spin_unlock(&gc2355mipi_drv_lock);
-#endif
-      break;
-    default:
-      ASSERT(0);
-    }
-    break;
-  case GC2355MIPI_FRAME_RATE_LIMITATION:
-    ASSERT(0);
-    break;
-  case GC2355MIPI_REGISTER_EDITOR:
-    switch (para->ItemIdx)
-    {
-      static kal_uint32 fac_sensor_reg;
-    case 0:
-      if (para->ItemValue < 0 || para->ItemValue > 0xFFFF) return KAL_FALSE;
-      fac_sensor_reg = para->ItemValue;
-      break;
-    case 1:
-      if (para->ItemValue < 0 || para->ItemValue > 0xFF) return KAL_FALSE;
-      GC2355MIPI_write_cmos_sensor(fac_sensor_reg, para->ItemValue);
-      break;
-    default:
-      ASSERT(0);
-    }
-    break;
-  default:
-    ASSERT(0);
-  }
-  return KAL_TRUE;
-}
-
-void GC2355MIPI_SetMirrorFlip(GC2355MIPI_IMAGE_MIRROR Mirror)
-{
-/*	switch(Mirror)
+//	else if(ANALOG_GAIN_4<= iReg)
+    else
 	{
-		case GC2355MIPI_IMAGE_NORMAL://IMAGE_NORMAL:
-		   GC2355MIPI_write_cmos_sensor(0x17,0x14);
-		   GC2355MIPI_write_cmos_sensor(0x92,0x01);
-		   GC2355MIPI_write_cmos_sensor(0x94,0x01);
-		    break;
-		case GC2355MIPI_IMAGE_H_MIRROR://IMAGE_H_MIRROR:
-		   GC2355MIPI_write_cmos_sensor(0x17,0x15);
-		   GC2355MIPI_write_cmos_sensor(0x92,0x01);
-		   GC2355MIPI_write_cmos_sensor(0x94,0x00);
-		    break;
-		case GC2355MIPI_IMAGE_V_MIRROR://IMAGE_V_MIRROR:
-		   GC2355MIPI_write_cmos_sensor(0x17,0x16);
-		   GC2355MIPI_write_cmos_sensor(0x92,0x02);
-		   GC2355MIPI_write_cmos_sensor(0x94,0x01);
-		    break;
-		case GC2355MIPI_IMAGE_HV_MIRROR://IMAGE_HV_MIRROR:
-		   GC2355MIPI_write_cmos_sensor(0x17,0x17);
-		   GC2355MIPI_write_cmos_sensor(0x92,0x02);
-		   GC2355MIPI_write_cmos_sensor(0x94,0x00);
-		    break;
-	}*/
+			//analog gain
+			GC2355_write_cmos_sensor(0xb6,	0x03);//
+			temp = 64*iReg/ANALOG_GAIN_4;
+			GC2355_write_cmos_sensor(0xb1, temp>>6);
+			GC2355_write_cmos_sensor(0xb2, (temp<<2)&0xfc);
+			
+			GC2355DB("GC2355 analogic gain 2.8x, temp = %d\n", temp);
+	}
+
+}   /*  GC2355_SetGain_SetGain  */
+
+
+void GC2355_camera_para_to_sensor(void)
+{}
+
+void GC2355_sensor_to_camera_para(void)
+{}
+
+kal_int32  GC2355_get_sensor_group_count(void)
+{
+    return GROUP_TOTAL_NUMS;
 }
 
-static void GC2355MIPI_Sensor_Init(void)
+void GC2355_get_sensor_group_info(kal_uint16 group_idx, kal_int8* group_name_ptr, kal_int32* item_count_ptr)
+{}
+void GC2355_get_sensor_item_info(kal_uint16 group_idx,kal_uint16 item_idx, MSDK_SENSOR_ITEM_INFO_STRUCT* info_ptr)
+{}
+kal_bool GC2355_set_sensor_item_info(kal_uint16 group_idx, kal_uint16 item_idx, kal_int32 ItemValue)
+{    return KAL_TRUE;}
+
+static void GC2355_SetDummy( const kal_uint32 iPixels, const kal_uint32 iLines )
 {
-	/////////////////////////////////////////////////////
-	//////////////////////	 SYS   //////////////////////
-	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0xfe,0x80);
-	GC2355MIPI_write_cmos_sensor(0xfe,0x80);
-	GC2355MIPI_write_cmos_sensor(0xfe,0x80);
-	GC2355MIPI_write_cmos_sensor(0xf2,0x00); 
-	GC2355MIPI_write_cmos_sensor(0xf6,0x00); 
-#if defined(GC2355MIPI_2Lane)
-	GC2355MIPI_write_cmos_sensor(0xf7,0x31); 
-#else
-	GC2355MIPI_write_cmos_sensor(0xf7,0x19); 
-#endif
-	GC2355MIPI_write_cmos_sensor(0xf8,0x06); 
-	GC2355MIPI_write_cmos_sensor(0xf9,0x0e); 
-	GC2355MIPI_write_cmos_sensor(0xfa,0x00); 
-	GC2355MIPI_write_cmos_sensor(0xfc,0x06); 
-	GC2355MIPI_write_cmos_sensor(0xfe,0x00);
+ 	kal_uint32 hb = 0;
+	kal_uint32 vb = 0;
+
+	if ( SENSOR_MODE_PREVIEW == gc2355.sensorMode )	//SXGA size output
+	{
+		hb = GC2355_DEFAULT_DUMMY_PIXEL_NUMS + iPixels;
+		vb = GC2355_DEFAULT_DUMMY_LINE_NUMS + iLines;
+	}
+	else if( SENSOR_MODE_VIDEO== gc2355.sensorMode )
+	{
+		hb = GC2355_DEFAULT_DUMMY_PIXEL_NUMS + iPixels;
+		vb = GC2355_DEFAULT_DUMMY_LINE_NUMS + iLines;
+	}
+	else//QSXGA size output
+	{
+		hb = GC2355_DEFAULT_DUMMY_PIXEL_NUMS + iPixels;
+		vb = GC2355_DEFAULT_DUMMY_LINE_NUMS + iLines;
+	}
+
+	//if(gc2355.maxExposureLines > frame_length -4 )
+	//	return;
+
+	//ASSERT(line_length < GC2355_MAX_LINE_LENGTH);		//0xCCCC
+	//ASSERT(frame_length < GC2355_MAX_FRAME_LENGTH);	//0xFFFF
+
+	//Set HB
+	GC2355_write_cmos_sensor(0x05, (hb >> 8)& 0xFF);
+	GC2355_write_cmos_sensor(0x06, hb & 0xFF);
+
+	//Set VB
+	GC2355_write_cmos_sensor(0x07, (vb >> 8) & 0xFF);
+	GC2355_write_cmos_sensor(0x08, vb & 0xFF);
+	GC2355DB("GC2355_SetDummy framelength=%d\n",vb+GC2355_VALID_LINE_NUMS);
+
+}   /*  GC2355_SetDummy */
+
+static void GC2355_Sensor_Init(void)
+{
+	/* SYS */
+	GC2355_write_cmos_sensor(0xfe,0x80);
+	GC2355_write_cmos_sensor(0xfe,0x80);
+	GC2355_write_cmos_sensor(0xfe,0x80);
+	GC2355_write_cmos_sensor(0xf2,0x00); 
+	GC2355_write_cmos_sensor(0xf6,0x00); 
+
+	GC2355_write_cmos_sensor(0xf7,0x31); 
+	GC2355_write_cmos_sensor(0xf8,0x06); 
+	GC2355_write_cmos_sensor(0xf9,0x0e); 
+	GC2355_write_cmos_sensor(0xfa,0x00); 
+	GC2355_write_cmos_sensor(0xfc,0x06); 
+	GC2355_write_cmos_sensor(0xfe,0x00);
 	
 	/////////////////////////////////////////////////////
 	///////////////    ANALOG & CISCTL    ///////////////
 	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0x03,0x07); 
-	GC2355MIPI_write_cmos_sensor(0x04,0xd0); 
-	GC2355MIPI_write_cmos_sensor(0x05,0x03);
-	GC2355MIPI_write_cmos_sensor(0x06,0x4c);
-	GC2355MIPI_write_cmos_sensor(0x07,0x00);
-	GC2355MIPI_write_cmos_sensor(0x08,0x12);
-	GC2355MIPI_write_cmos_sensor(0x0a,0x00);
-	GC2355MIPI_write_cmos_sensor(0x0c,0x04);
-	GC2355MIPI_write_cmos_sensor(0x0d,0x04);
-	GC2355MIPI_write_cmos_sensor(0x0e,0xc0);
-	GC2355MIPI_write_cmos_sensor(0x0f,0x06);
-	GC2355MIPI_write_cmos_sensor(0x10,0x50);
-	GC2355MIPI_write_cmos_sensor(0x17,0x17);
-	GC2355MIPI_write_cmos_sensor(0x19,0x0b);
-	GC2355MIPI_write_cmos_sensor(0x1b,0x48);
-	GC2355MIPI_write_cmos_sensor(0x1c,0x12);
-	GC2355MIPI_write_cmos_sensor(0x1d,0x10);
-	GC2355MIPI_write_cmos_sensor(0x1e,0xbc);
-	GC2355MIPI_write_cmos_sensor(0x1f,0xc9);
-	GC2355MIPI_write_cmos_sensor(0x20,0x71);
-	GC2355MIPI_write_cmos_sensor(0x21,0x20);
-	GC2355MIPI_write_cmos_sensor(0x22,0xa0);
-	GC2355MIPI_write_cmos_sensor(0x23,0x51);
-	GC2355MIPI_write_cmos_sensor(0x24,0x19);
-	GC2355MIPI_write_cmos_sensor(0x27,0x20);
-	GC2355MIPI_write_cmos_sensor(0x28,0x00);
-	GC2355MIPI_write_cmos_sensor(0x2b,0x80);// 0x81 20140926
-	GC2355MIPI_write_cmos_sensor(0x2c,0x38);
-	GC2355MIPI_write_cmos_sensor(0x2e,0x16);
-	GC2355MIPI_write_cmos_sensor(0x2f,0x14);
-	GC2355MIPI_write_cmos_sensor(0x30,0x00);
-	GC2355MIPI_write_cmos_sensor(0x31,0x01);
-	GC2355MIPI_write_cmos_sensor(0x32,0x02);
-	GC2355MIPI_write_cmos_sensor(0x33,0x03);
-	GC2355MIPI_write_cmos_sensor(0x34,0x07);
-	GC2355MIPI_write_cmos_sensor(0x35,0x0b);
-	GC2355MIPI_write_cmos_sensor(0x36,0x0f);
-	
-    /////////////////////////////////////////////////////
-	//////////////////////   MIPI   /////////////////////
-	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0xfe, 0x03);
-#if defined(GC2355MIPI_2Lane)
-	GC2355MIPI_write_cmos_sensor(0x10, 0x81);
-	GC2355MIPI_write_cmos_sensor(0x01, 0x87);
-	GC2355MIPI_write_cmos_sensor(0x22, 0x03);  
-	GC2355MIPI_write_cmos_sensor(0x23, 0x20);
-	GC2355MIPI_write_cmos_sensor(0x25, 0x10);
-	GC2355MIPI_write_cmos_sensor(0x29, 0x02);
-#else
-	GC2355MIPI_write_cmos_sensor(0x10, 0x80);
-	GC2355MIPI_write_cmos_sensor(0x01, 0x83);
-	GC2355MIPI_write_cmos_sensor(0x22, 0x05);  
-	GC2355MIPI_write_cmos_sensor(0x23, 0x30);
-	GC2355MIPI_write_cmos_sensor(0x25, 0x15);
-	GC2355MIPI_write_cmos_sensor(0x29, 0x06);
-#endif
-	GC2355MIPI_write_cmos_sensor(0x02, 0x00);
-	GC2355MIPI_write_cmos_sensor(0x03, 0x90);
-	GC2355MIPI_write_cmos_sensor(0x04, 0x01);
-	GC2355MIPI_write_cmos_sensor(0x05, 0x00);
-	GC2355MIPI_write_cmos_sensor(0x06, 0xa2);
-	GC2355MIPI_write_cmos_sensor(0x11, 0x2b);
-	GC2355MIPI_write_cmos_sensor(0x12, 0xd0); 
-	GC2355MIPI_write_cmos_sensor(0x13, 0x07); 
-	GC2355MIPI_write_cmos_sensor(0x15, 0x60);
+	GC2355_write_cmos_sensor(0x03,0x04);  // 0a -> 04
+	GC2355_write_cmos_sensor(0x04,0xb0);  // 41 -> b0
+	GC2355_write_cmos_sensor(0x05,0x01); //max 30fps  03
+	GC2355_write_cmos_sensor(0x06,0x1c); 
+	GC2355_write_cmos_sensor(0x07,0x00);
+	GC2355_write_cmos_sensor(0x08,0x0e); //22
+	GC2355_write_cmos_sensor(0x0a,0x00);
+	GC2355_write_cmos_sensor(0x0c,0x04);
+	GC2355_write_cmos_sensor(0x0d,0x04);
+	GC2355_write_cmos_sensor(0x0e,0xc0); //c0
+	GC2355_write_cmos_sensor(0x0f,0x06); 
+	GC2355_write_cmos_sensor(0x10,0x50); //Window setting 1616x1216
 
-	GC2355MIPI_write_cmos_sensor(0x21, 0x10);
-	GC2355MIPI_write_cmos_sensor(0x24, 0x02);
-	GC2355MIPI_write_cmos_sensor(0x26, 0x08);
-	GC2355MIPI_write_cmos_sensor(0x27, 0x06);
-	GC2355MIPI_write_cmos_sensor(0x2a, 0x0a); 
-	GC2355MIPI_write_cmos_sensor(0x2b, 0x08);
+	GC2355_write_cmos_sensor(0x17,0x17);//14
 	
-	GC2355MIPI_write_cmos_sensor(0x40, 0x00);
-	GC2355MIPI_write_cmos_sensor(0x41, 0x00);    
-	GC2355MIPI_write_cmos_sensor(0x42, 0x40);
-	GC2355MIPI_write_cmos_sensor(0x43, 0x06);  
-	GC2355MIPI_write_cmos_sensor(0xfe, 0x00);
+	GC2355_write_cmos_sensor(0x19,0x0b);
+	GC2355_write_cmos_sensor(0x1b,0x48);
+	GC2355_write_cmos_sensor(0x1c,0x12);
+	GC2355_write_cmos_sensor(0x1d,0x10);
+	GC2355_write_cmos_sensor(0x1e,0xbc);
+	GC2355_write_cmos_sensor(0x1f,0xc9);
+	GC2355_write_cmos_sensor(0x20,0x71);
+	GC2355_write_cmos_sensor(0x21,0x20); //rsg µ∆π‹∫·ÃıŒ∆	//////40
+	GC2355_write_cmos_sensor(0x22,0xa0); //e0	//80  //f0
+	GC2355_write_cmos_sensor(0x23,0x51); //51
+	GC2355_write_cmos_sensor(0x24,0x19); //0b //55
+	
+	GC2355_write_cmos_sensor(0x27,0x20);
+	GC2355_write_cmos_sensor(0x28,0x00);
+	GC2355_write_cmos_sensor(0x2b,0x80);// 0x81 20140926
+	GC2355_write_cmos_sensor(0x2c,0x38);
+	GC2355_write_cmos_sensor(0x2e,0x16);
+	GC2355_write_cmos_sensor(0x2f,0x14);
+	GC2355_write_cmos_sensor(0x30,0x00);
+	GC2355_write_cmos_sensor(0x31,0x01);
+	GC2355_write_cmos_sensor(0x32,0x02);
+	GC2355_write_cmos_sensor(0x33,0x03);
+	GC2355_write_cmos_sensor(0x34,0x07);
+	GC2355_write_cmos_sensor(0x35,0x0b);
+	GC2355_write_cmos_sensor(0x36,0x0f);
+	
+  
 
 	/////////////////////////////////////////////////////
 	//////////////////////	 gain   /////////////////////
 	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0xb0,0x50);
-	GC2355MIPI_write_cmos_sensor(0xb1,0x01);
-	GC2355MIPI_write_cmos_sensor(0xb2,0x00);
-	GC2355MIPI_write_cmos_sensor(0xb3,0x40);
-	GC2355MIPI_write_cmos_sensor(0xb4,0x40);
-	GC2355MIPI_write_cmos_sensor(0xb5,0x40);
-	GC2355MIPI_write_cmos_sensor(0xb6,0x00);
-
-	/////////////////////////////////////////////////////
-	//////////////////////   crop   /////////////////////
-	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0x92,0x02);
-	GC2355MIPI_write_cmos_sensor(0x94,0x00);
-	GC2355MIPI_write_cmos_sensor(0x95,0x04);
-	GC2355MIPI_write_cmos_sensor(0x96,0xb0);
-	GC2355MIPI_write_cmos_sensor(0x97,0x06);
-	GC2355MIPI_write_cmos_sensor(0x98,0x40); 
+	GC2355_write_cmos_sensor(0xb0,0x50);
+	GC2355_write_cmos_sensor(0xb1,0x01);
+	GC2355_write_cmos_sensor(0xb2,0x00);
+	GC2355_write_cmos_sensor(0xb3,0x40);
+	GC2355_write_cmos_sensor(0xb4,0x40);
+	GC2355_write_cmos_sensor(0xb5,0x40);
+	GC2355_write_cmos_sensor(0xb6,0x00);
+	
+	/* crop */
+	GC2355_write_cmos_sensor(0x92,0x02);
+	GC2355_write_cmos_sensor(0x95,0x04);
+	GC2355_write_cmos_sensor(0x96,0xb0);
+	GC2355_write_cmos_sensor(0x97,0x06);
+	GC2355_write_cmos_sensor(0x98,0x40); 
 
 	/////////////////////////////////////////////////////
 	//////////////////////    BLK   /////////////////////
 	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0x18,0x02);
-	GC2355MIPI_write_cmos_sensor(0x1a,0x01);
-	GC2355MIPI_write_cmos_sensor(0x40,0x42);
-	GC2355MIPI_write_cmos_sensor(0x41,0x00); 
-	GC2355MIPI_write_cmos_sensor(0x44,0x00); 
-	GC2355MIPI_write_cmos_sensor(0x45,0x00);
-	GC2355MIPI_write_cmos_sensor(0x46,0x00);	
-	GC2355MIPI_write_cmos_sensor(0x47,0x00); 
-	GC2355MIPI_write_cmos_sensor(0x48,0x00); 
-	GC2355MIPI_write_cmos_sensor(0x49,0x00);
-	GC2355MIPI_write_cmos_sensor(0x4a,0x00);	
-	GC2355MIPI_write_cmos_sensor(0x4b,0x00);	
-	GC2355MIPI_write_cmos_sensor(0x4e,0x3c); 
-	GC2355MIPI_write_cmos_sensor(0x4f,0x00); 
-	GC2355MIPI_write_cmos_sensor(0x5e,0x00);
-	GC2355MIPI_write_cmos_sensor(0x66,0x20);
-	GC2355MIPI_write_cmos_sensor(0x6a,0x02);
-	GC2355MIPI_write_cmos_sensor(0x6b,0x02);
-	GC2355MIPI_write_cmos_sensor(0x6c,0x02);
-	GC2355MIPI_write_cmos_sensor(0x6d,0x02);
-	GC2355MIPI_write_cmos_sensor(0x6e,0x02);
-	GC2355MIPI_write_cmos_sensor(0x6f,0x02);
-	GC2355MIPI_write_cmos_sensor(0x70,0x02);
-	GC2355MIPI_write_cmos_sensor(0x71,0x02);
+	GC2355_write_cmos_sensor(0x18,0x02);
+	GC2355_write_cmos_sensor(0x1a,0x01);
+	GC2355_write_cmos_sensor(0x40,0x42);
+	GC2355_write_cmos_sensor(0x41,0x00); 
+	GC2355_write_cmos_sensor(0x44,0x00); 
+	GC2355_write_cmos_sensor(0x45,0x00);
+	GC2355_write_cmos_sensor(0x46,0x00);	
+	GC2355_write_cmos_sensor(0x47,0x00); 
+	GC2355_write_cmos_sensor(0x48,0x00); 
+	GC2355_write_cmos_sensor(0x49,0x00);
+	GC2355_write_cmos_sensor(0x4a,0x00);	
+	GC2355_write_cmos_sensor(0x4b,0x00);	
+	GC2355_write_cmos_sensor(0x4e,0x3c); 
+	GC2355_write_cmos_sensor(0x4f,0x00); 
+	GC2355_write_cmos_sensor(0x5e,0x00);
+        //GC2355_write_cmos_sensor(0x5c,0x04);
+	GC2355_write_cmos_sensor(0x66,0x20);
+	GC2355_write_cmos_sensor(0x6a,0x00);
+	GC2355_write_cmos_sensor(0x6b,0x00);
+	GC2355_write_cmos_sensor(0x6c,0x00);
+	GC2355_write_cmos_sensor(0x6d,0x00);
+	GC2355_write_cmos_sensor(0x6e,0x00);
+	GC2355_write_cmos_sensor(0x6f,0x00);
+	GC2355_write_cmos_sensor(0x70,0x00);
+	GC2355_write_cmos_sensor(0x71,0x00);
 
 	/////////////////////////////////////////////////////
 	////////////////////  dark sun  /////////////////////
 	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0x87,0x03); 
-	GC2355MIPI_write_cmos_sensor(0xe0,0xe7); 
-	GC2355MIPI_write_cmos_sensor(0xe3,0xc0); 
-
+	GC2355_write_cmos_sensor(0x87,0x03); 
+	GC2355_write_cmos_sensor(0xe0,0xe7); 
+	GC2355_write_cmos_sensor(0xe3,0xc0); 
+	
 	/////////////////////////////////////////////////////
 	//////////////////////   MIPI   /////////////////////
 	/////////////////////////////////////////////////////
-	GC2355MIPI_write_cmos_sensor(0xfe, 0x03);
-#if defined(GC2355MIPI_2Lane)
-	GC2355MIPI_write_cmos_sensor(0x10, 0x91);
-#else
-	GC2355MIPI_write_cmos_sensor(0x10, 0x90);
-#endif
-	GC2355MIPI_write_cmos_sensor(0xfe, 0x00);
+	  GC2355_write_cmos_sensor(0xfe, 0x03);
+	  GC2355_write_cmos_sensor(0x01, 0x87);
+	  GC2355_write_cmos_sensor(0x02, 0x11);
+	  GC2355_write_cmos_sensor(0x03, 0x91);
+	  GC2355_write_cmos_sensor(0x04, 0x01);
+	  GC2355_write_cmos_sensor(0x05, 0x00);
+	  GC2355_write_cmos_sensor(0x06, 0xa2);
+	  GC2355_write_cmos_sensor(0x10, 0x91);//91//94//1lane raw8
+	  GC2355_write_cmos_sensor(0x11, 0x2b);//2b
+	  GC2355_write_cmos_sensor(0x15, 0x60);
+	  GC2355_write_cmos_sensor(0x12, 0xd0); //d0//40
+	  GC2355_write_cmos_sensor(0x13, 0x07); //07//06
+	  GC2355_write_cmos_sensor(0x21, 0x10);
+	  GC2355_write_cmos_sensor(0x22, 0x03);  
+	  GC2355_write_cmos_sensor(0x23, 0x20);
+	  GC2355_write_cmos_sensor(0x24, 0x02);
+	  GC2355_write_cmos_sensor(0x25, 0x10);
+	  GC2355_write_cmos_sensor(0x26, 0x08);
+	//	GC2355_write_cmos_sensor(0x27, 0x06);
+	  GC2355_write_cmos_sensor(0x29, 0x02);//04
+	  GC2355_write_cmos_sensor(0x2a, 0x0a);
+	  GC2355_write_cmos_sensor(0x2b, 0x08);
+	  GC2355_write_cmos_sensor(0x40, 0x00);
+	  GC2355_write_cmos_sensor(0x41, 0x00);    
+	  GC2355_write_cmos_sensor(0x42, 0x40);
+	  GC2355_write_cmos_sensor(0x43, 0x06);  
+	  GC2355_write_cmos_sensor(0xfe, 0x00);
 
-}   /*  GC2355MIPI_Sensor_Init  */
+}   /*  GC2355_Sensor_Init  */
 
-/*****************************************************************************/
-/* Windows Mobile Sensor Interface */
-/*****************************************************************************/
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPIOpen
-*
-* DESCRIPTION
-*	This function initialize the registers of CMOS sensor
-*
-* PARAMETERS
-*	None
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-
-UINT32 GC2355MIPIOpen(void)
+UINT32 GC2355Open(void)
 {
-	kal_uint16 sensor_id=0; 
-
-	// check if sensor ID correct
-	sensor_id=((GC2355MIPI_read_cmos_sensor(0xf0) << 8) | GC2355MIPI_read_cmos_sensor(0xf1));   
-#ifdef GC2355MIPI_DRIVER_TRACE
-	SENSORDB("GC2355MIPIOpen, sensor_id:%x \n",sensor_id);
-#endif		
-	if (sensor_id != GC2355MIPI_SENSOR_ID)
-		return ERROR_SENSOR_CONNECT_FAIL;
-	
-	/* initail sequence write in  */
-	GC2355MIPI_Sensor_Init();
-
-//	GC2355MIPI_SetMirrorFlip(GC2355MIPI_sensor.Mirror);
-
-	return ERROR_NONE;
-}   /* GC2355MIPIOpen  */
-
-/*************************************************************************
-* FUNCTION
-*   GC2355MIPIGetSensorID
-*
-* DESCRIPTION
-*   This function get the sensor ID 
-*
-* PARAMETERS
-*   *sensorID : return the sensor ID 
-*
-* RETURNS
-*   None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-UINT32 GC2355MIPIGetSensorID(UINT32 *sensorID) 
-{
-	// check if sensor ID correct
-	*sensorID=((GC2355MIPI_read_cmos_sensor(0xf0) << 8) | GC2355MIPI_read_cmos_sensor(0xf1));	
-#ifdef GC2355MIPI_DRIVER_TRACE
-	SENSORDB("GC2355MIPIGetSensorID:%x \n",*sensorID);
-#endif		
-	if (*sensorID != GC2355MIPI_SENSOR_ID) {		
-		*sensorID = 0xFFFFFFFF;		
-		return ERROR_SENSOR_CONNECT_FAIL;
+    int retry = 3;
+	volatile signed int i;
+	kal_uint16 sensor_id = 0;
+	GC2355DB("GC2355Open enter :\n ");
+    while(retry-- > 0)
+    {
+	sensor_id=((GC2355_read_cmos_sensor(0xf0) << 8) | GC2355_read_cmos_sensor(0xf1)); 
+	GC2355DB("GC2355MIPIGetSensorID:%x \n",sensor_id);
+        
+	if (sensor_id == GC2355MIPI_SENSOR_ID) {
+        	retry = 0;
 	}
-   return ERROR_NONE;
+    }
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.sensorMode = SENSOR_MODE_INIT;
+	gc2355.GC2355AutoFlickerMode = KAL_FALSE;
+	gc2355.GC2355VideoMode = KAL_FALSE;
+	gc2355.shutter = 0xff;
+	gc2355.Gain = 64;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+	GC2355_Sensor_Init();
+
+	GC2355DB("GC2355Open exit :\n ");
+
+    return ERROR_NONE;
 }
 
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPIClose
-*
-* DESCRIPTION
-*	This function is to turn off sensor module power.
-*
-* PARAMETERS
-*	None
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-UINT32 GC2355MIPIClose(void)
+UINT32 GC2355GetSensorID(UINT32 *sensorID)
 {
-#ifdef GC2355MIPI_DRIVER_TRACE
-   SENSORDB("GC2355MIPIClose\n");
-#endif
-  //kdCISModulePowerOn(SensorIdx,currSensorName,0,mode_name);
-//	DRV_I2CClose(GC2355MIPIhDrvI2C);
-	return ERROR_NONE;
-}   /* GC2355MIPIClose */
+    int  retry = 3;
 
-/*************************************************************************
-* FUNCTION
-* GC2355MIPIPreview
-*
-* DESCRIPTION
-*	This function start the sensor preview.
-*
-* PARAMETERS
-*	*image_window : address pointer of pixel numbers in one period of HSYNC
-*  *sensor_config_data : address pointer of line numbers in one period of VSYNC
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-UINT32 GC2355MIPIPreview(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *image_window,
-					  MSDK_SENSOR_CONFIG_STRUCT *sensor_config_data)
+	GC2355DB("GC2355GetSensorID enter :\n ");
+
+    // check if sensor ID correct
+  while(retry-- > 0)
+  {
+    *sensorID =((GC2355_read_cmos_sensor(0xf0) << 8) | GC2355_read_cmos_sensor(0xf1)); 
+	GC2355DB("GC2355MIPIGetSensorID:%x \n",*sensorID);
+    if (*sensorID == GC2355MIPI_SENSOR_ID) {
+        retry = 0;
+    }
+  }
+
+    if (*sensorID != GC2355MIPI_SENSOR_ID) {
+        *sensorID = 0xFFFFFFFF;
+        return ERROR_SENSOR_CONNECT_FAIL;
+    }
+    return ERROR_NONE;
+}
+
+
+void GC2355_SetShutter(kal_uint32 iShutter)
 {
-	
-#if defined(MT6577)||defined(MT6589)
-	spin_lock(&gc2355mipi_drv_lock);	
-#endif
-	GC2355MIPI_sensor.pv_mode = KAL_TRUE;
-	
-	//GC2355MIPI_set_mirror(sensor_config_data->SensorImageMirror);
-	switch (sensor_config_data->SensorOperationMode)
+    //kal_uint8 i=0;
+	if(MSDK_SCENARIO_ID_CAMERA_ZSD == GC2355CurrentScenarioId )
 	{
-	  case MSDK_SENSOR_OPERATION_MODE_VIDEO: 	  	
-		GC2355MIPI_sensor.video_mode = KAL_TRUE;
-	  default: /* ISP_PREVIEW_MODE */
-		GC2355MIPI_sensor.video_mode = KAL_FALSE;
+		//GC2355DB("always UPDATE SHUTTER when gc2355.sensorMode == SENSOR_MODE_CAPTURE\n");
 	}
-	GC2355MIPI_sensor.line_length = GC2355MIPI_PV_PERIOD_PIXEL_NUMS;
-	GC2355MIPI_sensor.frame_height = GC2355MIPI_PV_PERIOD_LINE_NUMS;
-	GC2355MIPI_sensor.pclk = GC2355MIPI_PREVIEW_CLK;
-#if defined(MT6577)||defined(MT6589)
-	spin_unlock(&gc2355mipi_drv_lock);
-#endif
-	//GC2355MIPI_Write_Shutter(GC2355MIPI_sensor.shutter);
-	return ERROR_NONE;
-}   /*  GC2355MIPIPreview   */
-
-/*************************************************************************
-* FUNCTION
-*	GC2355MIPICapture
-*
-* DESCRIPTION
-*	This function setup the CMOS sensor in capture MY_OUTPUT mode
-*
-* PARAMETERS
-*
-* RETURNS
-*	None
-*
-* GLOBALS AFFECTED
-*
-*************************************************************************/
-UINT32 GC2355MIPICapture(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *image_window,
-						  MSDK_SENSOR_CONFIG_STRUCT *sensor_config_data)
-{
-	kal_uint32 shutter = (kal_uint32)GC2355MIPI_sensor.shutter;
-#if defined(MT6577)||defined(MT6589)
-	spin_lock(&gc2355mipi_drv_lock);
-#endif
-	GC2355MIPI_sensor.video_mode = KAL_FALSE;
-		GC2355MIPI_sensor.pv_mode = KAL_FALSE;
-#if defined(MT6577)||defined(MT6589)
-		spin_unlock(&gc2355mipi_drv_lock);
-#endif
-	return ERROR_NONE;
-}   /* GC2355MIPI_Capture() */
-
-UINT32 GC2355MIPIGetResolution(MSDK_SENSOR_RESOLUTION_INFO_STRUCT *pSensorResolution)
-{
-	pSensorResolution->SensorFullWidth=GC2355MIPI_IMAGE_SENSOR_FULL_WIDTH;
-	pSensorResolution->SensorFullHeight=GC2355MIPI_IMAGE_SENSOR_FULL_HEIGHT;
-	pSensorResolution->SensorPreviewWidth=GC2355MIPI_IMAGE_SENSOR_PV_WIDTH;
-	pSensorResolution->SensorPreviewHeight=GC2355MIPI_IMAGE_SENSOR_PV_HEIGHT;
-	pSensorResolution->SensorVideoWidth=GC2355MIPI_IMAGE_SENSOR_VIDEO_WIDTH;
-	pSensorResolution->SensorVideoHeight=GC2355MIPI_IMAGE_SENSOR_VIDEO_HEIGHT;
-	return ERROR_NONE;
-}	/* GC2355MIPIGetResolution() */
-
-UINT32 GC2355MIPIGetInfo(MSDK_SCENARIO_ID_ENUM ScenarioId,
-					  MSDK_SENSOR_INFO_STRUCT *pSensorInfo,
-					  MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData)
-{
-	pSensorInfo->SensorPreviewResolutionX=GC2355MIPI_IMAGE_SENSOR_PV_WIDTH;
-	pSensorInfo->SensorPreviewResolutionY=GC2355MIPI_IMAGE_SENSOR_PV_HEIGHT;
-	pSensorInfo->SensorFullResolutionX=GC2355MIPI_IMAGE_SENSOR_FULL_WIDTH;
-	pSensorInfo->SensorFullResolutionY=GC2355MIPI_IMAGE_SENSOR_FULL_HEIGHT;
-
-	pSensorInfo->SensorCameraPreviewFrameRate=30;
-	pSensorInfo->SensorVideoFrameRate=30;
-	pSensorInfo->SensorStillCaptureFrameRate=10;
-	pSensorInfo->SensorWebCamCaptureFrameRate=15;
-	pSensorInfo->SensorResetActiveHigh=TRUE; //low active
-	pSensorInfo->SensorResetDelayCount=5; 
-	pSensorInfo->SensorOutputDataFormat=GC2355MIPI_COLOR_FORMAT;
-	pSensorInfo->SensorClockPolarity=SENSOR_CLOCK_POLARITY_LOW;	
-	pSensorInfo->SensorClockFallingPolarity=SENSOR_CLOCK_POLARITY_LOW;
-	pSensorInfo->SensorHsyncPolarity = SENSOR_CLOCK_POLARITY_LOW;
-	pSensorInfo->SensorVsyncPolarity = SENSOR_CLOCK_POLARITY_LOW;
-	
-
-	pSensorInfo->CaptureDelayFrame = 2; 
-	pSensorInfo->PreviewDelayFrame = 1;
-	pSensorInfo->VideoDelayFrame = 1;
-
-	pSensorInfo->SensorMasterClockSwitch = 0; 
-	pSensorInfo->SensorDrivingCurrent = ISP_DRIVING_8MA;
-	pSensorInfo->AEShutDelayFrame =0;		   /* The frame of setting shutter default 0 for TG int */
-	pSensorInfo->AESensorGainDelayFrame = 0;   /* The frame of setting sensor gain */
-	pSensorInfo->AEISPGainDelayFrame = 2;  
-
-	pSensorInfo->SensroInterfaceType=SENSOR_INTERFACE_TYPE_MIPI;
-#if defined(GC2355MIPI_2Lane)
-	pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_2_LANE;
-	//pSensorInfo->SensorRawType = RAW_TYPE_10BIT;
-#else
-	pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_1_LANE;
-#endif
-
-	pSensorInfo->MIPIDataLowPwr2HighSpeedTermDelayCount = 0; 
-	pSensorInfo->MIPIDataLowPwr2HighSpeedSettleDelayCount = 14; 
-	pSensorInfo->MIPICLKLowPwr2HighSpeedTermDelayCount = 0;
-	pSensorInfo->SensorWidthSampling = 0;
-	pSensorInfo->SensorHightSampling = 0;
-	pSensorInfo->SensorPacketECCOrder = 1;
-	switch (ScenarioId)
-	{
-		case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
-			pSensorInfo->SensorClockFreq=24;
-			pSensorInfo->SensorClockDividCount=3;
-			pSensorInfo->SensorClockRisingCount= 0;
-			pSensorInfo->SensorClockFallingCount= 2;
-			pSensorInfo->SensorPixelClockCount= 3;
-			pSensorInfo->SensorDataLatchCount= 2;
-			pSensorInfo->SensorGrabStartX = GC2355MIPI_PV_X_START; 
-			pSensorInfo->SensorGrabStartY = GC2355MIPI_PV_Y_START; 
-
-		break;
-		case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
-			pSensorInfo->SensorClockFreq=24;
-			pSensorInfo->SensorClockDividCount=3;
-			pSensorInfo->SensorClockRisingCount= 0;
-			pSensorInfo->SensorClockFallingCount= 2;
-			pSensorInfo->SensorPixelClockCount= 3;
-			pSensorInfo->SensorDataLatchCount= 2;
-			pSensorInfo->SensorGrabStartX = GC2355MIPI_VIDEO_X_START; 
-			pSensorInfo->SensorGrabStartY = GC2355MIPI_VIDEO_Y_START; 
-
-		break;
-		case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
-		case MSDK_SCENARIO_ID_CAMERA_ZSD:
-			pSensorInfo->SensorClockFreq=24;
-			pSensorInfo->SensorClockDividCount= 3;
-			pSensorInfo->SensorClockRisingCount=0;
-			pSensorInfo->SensorClockFallingCount=2;
-			pSensorInfo->SensorPixelClockCount=3;
-			pSensorInfo->SensorDataLatchCount=2;
-			pSensorInfo->SensorGrabStartX = GC2355MIPI_FULL_X_START; 
-			pSensorInfo->SensorGrabStartY = GC2355MIPI_FULL_Y_START; 
-		break;
-		default:
-			pSensorInfo->SensorClockFreq=24;
-			pSensorInfo->SensorClockDividCount=3;
-			pSensorInfo->SensorClockRisingCount=0;
-			pSensorInfo->SensorClockFallingCount=2;		
-			pSensorInfo->SensorPixelClockCount=3;
-			pSensorInfo->SensorDataLatchCount=2;
-			pSensorInfo->SensorGrabStartX = GC2355MIPI_PV_X_START; 
-			pSensorInfo->SensorGrabStartY = GC2355MIPI_PV_Y_START; 
-		break;
+	else{
+		if(gc2355.sensorMode == SENSOR_MODE_CAPTURE)
+		{
+			//GC2355DB("capture!!DONT UPDATE SHUTTER!!\n");
+			//return;
+		}
 	}
-	memcpy(pSensorConfigData, &GC2355MIPI_sensor.cfg_data, sizeof(MSDK_SENSOR_CONFIG_STRUCT));
-  return ERROR_NONE;
-}	/* GC2355MIPIGetInfo() */
+	if(gc2355.shutter == iShutter);
+		//return;
+	
+   spin_lock(&gc2355mipiraw_drv_lock);
+   gc2355.shutter= iShutter;
+  
+   spin_unlock(&gc2355mipiraw_drv_lock);
+   if(gc2355.shutter > 16383) gc2355.shutter = 16383;
+   if(gc2355.shutter < 7) gc2355.shutter = 7;
+   GC2355_write_cmos_sensor(0x03, (gc2355.shutter>>8) & 0x3F);
+   GC2355_write_cmos_sensor(0x04, gc2355.shutter & 0xFF);
+   	
+   
+   GC2355DB("GC2355_SetShutter:%x \n",iShutter); 
+   	
+ //  GC2355DB("GC2355_SetShutter 0x03=%x, 0x04=%x \n",GC2355_read_cmos_sensor(0x03),GC2355_read_cmos_sensor(0x04));
+   return;
+}   /*  GC2355_SetShutter   */
 
-
-UINT32 GC2355MIPIControl(MSDK_SCENARIO_ID_ENUM ScenarioId, MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *pImageWindow,
-					  MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData)
+UINT32 GC2355_read_shutter(void)
 {
 
-#ifdef GC2355_DRIVER_TRACE
-	SENSORDB("GC2355MIPIControl ScenarioId = %d \n",ScenarioId);
-#endif
-	switch (ScenarioId)
+	kal_uint16 temp_reg1, temp_reg2;
+	UINT32 shutter =0;
+	temp_reg1 = GC2355_read_cmos_sensor(0x03);    // AEC[b19~b16]
+	temp_reg2 = GC2355_read_cmos_sensor(0x04);    // AEC[b15~b8]
+	shutter  = ((temp_reg1 << 8)| (temp_reg2));
+
+	return shutter;
+}
+
+void GC2355_NightMode(kal_bool bEnable)
+{}
+
+
+UINT32 GC2355Close(void)
+{    return ERROR_NONE;}
+
+void GC2355SetFlipMirror(kal_int32 imgMirror)
+{
+	kal_int16 mirror=0,flip=0;
+
+    switch (imgMirror)
+    {
+        case IMAGE_NORMAL://IMAGE_NORMAL:
+			GC2355_write_cmos_sensor(0x17,0x14);//bit[1][0]
+//			GC2355_write_cmos_sensor(0x92,0x03);
+//			GC2355_write_cmos_sensor(0x94,0x0b);
+            break;
+        case IMAGE_H_MIRROR://IMAGE_H_MIRROR:
+            GC2355_write_cmos_sensor(0x17,0x15);
+//			GC2355_write_cmos_sensor(0x92,0x03);
+//			GC2355_write_cmos_sensor(0x94,0x0b);
+            break;
+        case IMAGE_V_MIRROR://IMAGE_V_MIRROR:
+            GC2355_write_cmos_sensor(0x17,0x16);
+//			GC2355_write_cmos_sensor(0x92,0x02);
+//			GC2355_write_cmos_sensor(0x94,0x0b);
+            break;
+        case IMAGE_HV_MIRROR://IMAGE_HV_MIRROR:
+			GC2355_write_cmos_sensor(0x17,0x17);
+//			GC2355_write_cmos_sensor(0x92,0x02);
+//			GC2355_write_cmos_sensor(0x94,0x0b);
+            break;
+    }
+}
+
+UINT32 GC2355Preview(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *image_window,
+                                                MSDK_SENSOR_CONFIG_STRUCT *sensor_config_data)
+{
+
+	GC2355DB("GC2355Preview enter:");
+
+	
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.sensorMode = SENSOR_MODE_PREVIEW; // Need set preview setting after capture mode
+	gc2355.DummyPixels = 0;//define dummy pixels and lines
+	gc2355.DummyLines = 0 ;
+	GC2355_FeatureControl_PERIOD_PixelNum=GC2355_PV_PERIOD_PIXEL_NUMS+ gc2355.DummyPixels;
+	GC2355_FeatureControl_PERIOD_LineNum=GC2355_PV_PERIOD_LINE_NUMS+gc2355.DummyLines;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+
+	//GC2355_write_shutter(gc2355.shutter);
+	//write_GC2355_gain(gc2355.pvGain);
+	//set mirror & flip
+	//GC2355DB("[GC2355Preview] mirror&flip: %d \n",sensor_config_data->SensorImageMirror);
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.imgMirror = sensor_config_data->SensorImageMirror;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+	//if(SENSOR_MODE_PREVIEW==gc2355.sensorMode ) return ERROR_NONE;
+	
+	GC2355DB("GC2355Preview mirror:%d\n",sensor_config_data->SensorImageMirror);
+	GC2355SetFlipMirror(GC2355_ORIENTATION);
+	GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+	GC2355DB("GC2355Preview exit: \n");
+	mdelay(100);
+    return ERROR_NONE;
+}	/* GC2355Preview() */
+
+
+UINT32 GC2355Video(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *image_window,
+                                                MSDK_SENSOR_CONFIG_STRUCT *sensor_config_data)
+{
+	GC2355DB("GC2355Video enter:");
+	if(gc2355.sensorMode == SENSOR_MODE_VIDEO)
 	{
-		case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
-		case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
-			GC2355MIPIPreview(pImageWindow, pSensorConfigData);
-		break;
-		case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+		// do nothing
+	}
+	else
+		//GC2355VideoSetting();
+	
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.sensorMode = SENSOR_MODE_VIDEO;
+	GC2355_FeatureControl_PERIOD_PixelNum=GC2355_VIDEO_PERIOD_PIXEL_NUMS+ gc2355.DummyPixels;
+	GC2355_FeatureControl_PERIOD_LineNum=GC2355_VIDEO_PERIOD_LINE_NUMS+gc2355.DummyLines;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+
+	//GC2355_write_shutter(gc2355.shutter);
+	//write_GC2355_gain(gc2355.pvGain);
+
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.imgMirror = sensor_config_data->SensorImageMirror;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+	GC2355SetFlipMirror(GC2355_ORIENTATION);
+	GC2355DB("GC2355Video mirror:%d\n",sensor_config_data->SensorImageMirror);
+
+	//GC2355DBSOFIA("[GC2355Video]frame_len=%x\n", ((GC2355_read_cmos_sensor(0x380e)<<8)+GC2355_read_cmos_sensor(0x380f)));
+
+	GC2355DB("GC2355Video exit:\n");
+    return ERROR_NONE;
+}
+
+
+UINT32 GC2355Capture(MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *image_window,
+                                                MSDK_SENSOR_CONFIG_STRUCT *sensor_config_data)
+{
+ 	kal_uint32 shutter = gc2355.shutter;
+	kal_uint32 temp_data;
+	if( SENSOR_MODE_CAPTURE== gc2355.sensorMode)
+	{
+		GC2355DB("GC2355Capture BusrtShot!!!\n");
+	}else{
+		GC2355DB("GC2355Capture enter:\n");
+		
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.pvShutter =shutter;
+		gc2355.sensorGlobalGain = temp_data;
+		gc2355.pvGain =gc2355.sensorGlobalGain;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+
+		GC2355DB("[GC2355Capture]gc2355.shutter=%d, read_pv_shutter=%d, read_pv_gain = 0x%x\n",gc2355.shutter, shutter,gc2355.sensorGlobalGain);
+
+		// Full size setting
+		//.GC2355CaptureSetting();
+
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.sensorMode = SENSOR_MODE_CAPTURE;
+		gc2355.imgMirror = sensor_config_data->SensorImageMirror;
+		gc2355.DummyPixels = 0;//define dummy pixels and lines                                                                                                         
+		gc2355.DummyLines = 0 ;    
+		GC2355_FeatureControl_PERIOD_PixelNum = GC2355_FULL_PERIOD_PIXEL_NUMS + gc2355.DummyPixels;
+		GC2355_FeatureControl_PERIOD_LineNum = GC2355_FULL_PERIOD_LINE_NUMS + gc2355.DummyLines;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+
+		//GC2355DB("[GC2355Capture] mirror&flip: %d\n",sensor_config_data->SensorImageMirror);
+		
+		GC2355DB("GC2355capture mirror:%d\n",sensor_config_data->SensorImageMirror);
+		GC2355SetFlipMirror(GC2355_ORIENTATION);
+		GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+
+	    if(GC2355CurrentScenarioId==MSDK_SCENARIO_ID_CAMERA_ZSD)
+	    {
+			GC2355DB("GC2355Capture exit ZSD!!\n");
+			return ERROR_NONE;
+	    }
+		GC2355DB("GC2355Capture exit:\n");
+	}
+
+    return ERROR_NONE;
+}	/* GC2355Capture() */
+
+UINT32 GC2355GetResolution(MSDK_SENSOR_RESOLUTION_INFO_STRUCT *pSensorResolution)
+{
+
+    GC2355DB("GC2355GetResolution!!\n");
+	pSensorResolution->SensorPreviewWidth	= GC2355_IMAGE_SENSOR_PV_WIDTH;
+    pSensorResolution->SensorPreviewHeight	= GC2355_IMAGE_SENSOR_PV_HEIGHT;
+    pSensorResolution->SensorFullWidth		= GC2355_IMAGE_SENSOR_FULL_WIDTH;
+    pSensorResolution->SensorFullHeight		= GC2355_IMAGE_SENSOR_FULL_HEIGHT;
+    pSensorResolution->SensorVideoWidth		= GC2355_IMAGE_SENSOR_VIDEO_WIDTH;
+    pSensorResolution->SensorVideoHeight    = GC2355_IMAGE_SENSOR_VIDEO_HEIGHT;
+    return ERROR_NONE;
+}   /* GC2355GetResolution() */
+
+UINT32 GC2355GetInfo(MSDK_SCENARIO_ID_ENUM ScenarioId,
+                                                MSDK_SENSOR_INFO_STRUCT *pSensorInfo,
+                                                MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData)
+{
+
+	pSensorInfo->SensorPreviewResolutionX= GC2355_IMAGE_SENSOR_PV_WIDTH;
+	pSensorInfo->SensorPreviewResolutionY= GC2355_IMAGE_SENSOR_PV_HEIGHT;
+	pSensorInfo->SensorFullResolutionX= GC2355_IMAGE_SENSOR_FULL_WIDTH;
+    pSensorInfo->SensorFullResolutionY= GC2355_IMAGE_SENSOR_FULL_HEIGHT;
+
+	spin_lock(&gc2355mipiraw_drv_lock);
+	gc2355.imgMirror = pSensorConfigData->SensorImageMirror ;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+
+	pSensorInfo->SensorOutputDataFormat= SENSOR_OUTPUT_FORMAT_RAW_R;
+	
+    pSensorInfo->SensorClockPolarity =SENSOR_CLOCK_POLARITY_LOW;
+    pSensorInfo->SensorClockFallingPolarity=SENSOR_CLOCK_POLARITY_LOW;
+    pSensorInfo->SensorHsyncPolarity = SENSOR_CLOCK_POLARITY_LOW;
+    pSensorInfo->SensorVsyncPolarity = SENSOR_CLOCK_POLARITY_LOW;
+
+    pSensorInfo->SensroInterfaceType=SENSOR_INTERFACE_TYPE_MIPI;
+	pSensorInfo->MIPIsensorType = MIPI_OPHY_CSI2;
+
+    pSensorInfo->CaptureDelayFrame = 4;
+    pSensorInfo->PreviewDelayFrame = 3;
+    pSensorInfo->VideoDelayFrame = 3;
+
+    pSensorInfo->SensorDrivingCurrent = ISP_DRIVING_8MA;
+    pSensorInfo->AEShutDelayFrame = 0;		    /* The frame of setting shutter default 0 for TG int */
+    pSensorInfo->AESensorGainDelayFrame = 0;     /* The frame of setting sensor gain */
+    pSensorInfo->AEISPGainDelayFrame = 2;
+
+    switch (ScenarioId)
+    {
+        case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+            pSensorInfo->SensorClockFreq=24;
+            pSensorInfo->SensorClockRisingCount= 0;
+
+            pSensorInfo->SensorGrabStartX = GC2355_PV_X_START;
+            pSensorInfo->SensorGrabStartY = GC2355_PV_Y_START;
+
+            pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_2_LANE;
+            pSensorInfo->MIPIDataLowPwr2HighSpeedTermDelayCount = 0;
+	     	pSensorInfo->MIPIDataLowPwr2HighSpeedSettleDelayCount = 14;
+	    	pSensorInfo->MIPICLKLowPwr2HighSpeedTermDelayCount = 0;
+            pSensorInfo->SensorPacketECCOrder = 1;
+            break;
+        case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+            pSensorInfo->SensorClockFreq=24;
+            pSensorInfo->SensorClockRisingCount= 0;
+
+            pSensorInfo->SensorGrabStartX = GC2355_VIDEO_X_START;
+            pSensorInfo->SensorGrabStartY = GC2355_VIDEO_Y_START;
+
+            pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_2_LANE;
+            pSensorInfo->MIPIDataLowPwr2HighSpeedTermDelayCount = 0;
+	     	pSensorInfo->MIPIDataLowPwr2HighSpeedSettleDelayCount = 14;
+	    	pSensorInfo->MIPICLKLowPwr2HighSpeedTermDelayCount = 0;
+            pSensorInfo->SensorPacketECCOrder = 1;
+            break;
+        case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
 		case MSDK_SCENARIO_ID_CAMERA_ZSD:
-			GC2355MIPICapture(pImageWindow, pSensorConfigData);
-		break;		
+            pSensorInfo->SensorClockFreq=24;
+            pSensorInfo->SensorClockRisingCount= 0;
+
+            pSensorInfo->SensorGrabStartX = GC2355_FULL_X_START;	//2*GC2355_IMAGE_SENSOR_PV_STARTX;
+            pSensorInfo->SensorGrabStartY = GC2355_FULL_Y_START;	//2*GC2355_IMAGE_SENSOR_PV_STARTY;
+
+            pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_2_LANE;
+            pSensorInfo->MIPIDataLowPwr2HighSpeedTermDelayCount = 0;
+            pSensorInfo->MIPIDataLowPwr2HighSpeedSettleDelayCount = 14;
+            pSensorInfo->MIPICLKLowPwr2HighSpeedTermDelayCount = 0;
+            pSensorInfo->SensorPacketECCOrder = 1;
+            break;
+        default:
+			pSensorInfo->SensorClockFreq=24;
+            pSensorInfo->SensorClockRisingCount= 0;
+
+            pSensorInfo->SensorGrabStartX = GC2355_PV_X_START;
+            pSensorInfo->SensorGrabStartY = GC2355_PV_Y_START;
+
+            pSensorInfo->SensorMIPILaneNumber = SENSOR_MIPI_2_LANE;
+            pSensorInfo->MIPIDataLowPwr2HighSpeedTermDelayCount = 0;
+	     	pSensorInfo->MIPIDataLowPwr2HighSpeedSettleDelayCount = 14;
+	    	pSensorInfo->MIPICLKLowPwr2HighSpeedTermDelayCount = 0;
+            pSensorInfo->SensorPacketECCOrder = 1;
+            break;
+    }
+
+    memcpy(pSensorConfigData, &GC2355SensorConfigData, sizeof(MSDK_SENSOR_CONFIG_STRUCT));
+
+    return ERROR_NONE;
+}   /* GC2355GetInfo() */
+
+
+UINT32 GC2355Control(MSDK_SCENARIO_ID_ENUM ScenarioId, MSDK_SENSOR_EXPOSURE_WINDOW_STRUCT *pImageWindow,
+                                                MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData)
+{
+		spin_lock(&gc2355mipiraw_drv_lock);
+		GC2355CurrentScenarioId = ScenarioId;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		GC2355DB("GC2355CurrentScenarioId=%d\n",GC2355CurrentScenarioId);
+    switch (ScenarioId)
+    {
+        case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+            GC2355Preview(pImageWindow, pSensorConfigData);
+            break;
+        case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+			GC2355Video(pImageWindow, pSensorConfigData);
+			break;
+        case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+		case MSDK_SCENARIO_ID_CAMERA_ZSD:
+            GC2355Capture(pImageWindow, pSensorConfigData);
+            break;
         default:
             return ERROR_INVALID_SCENARIO_ID;
-	}
-	return ERROR_NONE;
-}	/* GC2355MIPIControl() */
+    }
+    return ERROR_NONE;
+} /* GC2355Control() */
 
 
-
-UINT32 GC2355MIPISetVideoMode(UINT16 u2FrameRate)
-{};
-
-UINT32 GC2355MIPIFeatureControl(MSDK_SENSOR_FEATURE_ENUM FeatureId,
-							 UINT8 *pFeaturePara,UINT32 *pFeatureParaLen)
+UINT32 GC2355SetVideoMode(UINT16 u2FrameRate)
 {
-	UINT16 *pFeatureReturnPara16=(UINT16 *) pFeaturePara;
-	UINT16 *pFeatureData16=(UINT16 *) pFeaturePara;
-	UINT32 *pFeatureReturnPara32=(UINT32 *) pFeaturePara;
-	//UINT32 *pFeatureData32=(UINT32 *) pFeaturePara;
-	//UINT32 GC2355MIPISensorRegNumber;
-	//UINT32 i;
-	//PNVRAM_SENSOR_DATA_STRUCT pSensorDefaultData=(PNVRAM_SENSOR_DATA_STRUCT) pFeaturePara;
-	//MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData=(MSDK_SENSOR_CONFIG_STRUCT *) pFeaturePara;
-	MSDK_SENSOR_REG_INFO_STRUCT *pSensorRegData=(MSDK_SENSOR_REG_INFO_STRUCT *) pFeaturePara;
-	//MSDK_SENSOR_GROUP_INFO_STRUCT *pSensorGroupInfo=(MSDK_SENSOR_GROUP_INFO_STRUCT *) pFeaturePara;
-	//MSDK_SENSOR_ITEM_INFO_STRUCT *pSensorItemInfo=(MSDK_SENSOR_ITEM_INFO_STRUCT *) pFeaturePara;
-	//MSDK_SENSOR_ENG_INFO_STRUCT	*pSensorEngInfo=(MSDK_SENSOR_ENG_INFO_STRUCT *) pFeaturePara;
+    kal_uint32 MIN_Frame_length =0,extralines=0;
+    GC2355DB("[GC2355SetVideoMode] frame rate = %d\n", u2FrameRate);
 
-	switch (FeatureId)
+	spin_lock(&gc2355mipiraw_drv_lock);
+	 gc2355VIDEO_MODE_TARGET_FPS=u2FrameRate;
+	spin_unlock(&gc2355mipiraw_drv_lock);
+
+	if(u2FrameRate==0)
+	{   
+		GC2355DB("Disable Video Mode or dynimac fps\n");	
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.DummyPixels = 0;//define dummy pixels and lines
+		gc2355.DummyLines = extralines ;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		//GC2355_SetDummy(gc2355.DummyPixels ,gc2355.DummyLines);
+		return KAL_TRUE;
+	}
+	
+	if(u2FrameRate >30 || u2FrameRate <5)
+	    GC2355DB("error frame rate seting %fps\n",u2FrameRate);
+
+    if(gc2355.sensorMode == SENSOR_MODE_VIDEO)//video ScenarioId recording
+    {
+    	if(u2FrameRate==30)
+    		{
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.DummyPixels = 0;//define dummy pixels and lines
+		gc2355.DummyLines = 0 ;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		
+		GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+    		}
+		else
+		{
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.DummyPixels = 0;//define dummy pixels and lines
+		MIN_Frame_length = (GC2355MIPI_VIDEO_CLK)/(GC2355_VIDEO_PERIOD_PIXEL_NUMS + gc2355.DummyPixels)/u2FrameRate;
+		gc2355.DummyLines = MIN_Frame_length - GC2355_VALID_LINE_NUMS-GC2355_DEFAULT_DUMMY_LINE_NUMS;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		GC2355DB("GC2355SetVideoMode MIN_Frame_length %d\n",MIN_Frame_length);
+		
+		GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+    		}	
+    }
+	else if(gc2355.sensorMode == SENSOR_MODE_CAPTURE)
 	{
-		case SENSOR_FEATURE_GET_RESOLUTION:
-			*pFeatureReturnPara16++=GC2355MIPI_IMAGE_SENSOR_FULL_WIDTH;
-			*pFeatureReturnPara16=GC2355MIPI_IMAGE_SENSOR_FULL_HEIGHT;
-			*pFeatureParaLen=4;
-		break;
-		case SENSOR_FEATURE_GET_PERIOD:	/* 3 */
-			*pFeatureReturnPara16++=GC2355MIPI_sensor.line_length;
-			*pFeatureReturnPara16=GC2355MIPI_sensor.frame_height;
-			*pFeatureParaLen=4;
-		break;
-		case SENSOR_FEATURE_GET_PIXEL_CLOCK_FREQ:  /* 3 */
-			*pFeatureReturnPara32 = GC2355MIPI_sensor.pclk;
-			*pFeatureParaLen=4;
-		break;
-		case SENSOR_FEATURE_SET_ESHUTTER:	/* 4 */
-			GC2355MIPI_set_shutter(*pFeatureData16);
-		break;
-		case SENSOR_FEATURE_SET_NIGHTMODE:
-			GC2355MIPI_night_mode((BOOL) *pFeatureData16);
-		break;
-		case SENSOR_FEATURE_SET_GAIN:	/* 6 */			
-			GC2355MIPI_SetGain((UINT16) *pFeatureData16);
-		break;
-		case SENSOR_FEATURE_SET_FLASHLIGHT:
-		break;
-		case SENSOR_FEATURE_SET_ISP_MASTER_CLOCK_FREQ:
-		break;
-		case SENSOR_FEATURE_SET_REGISTER:
-			GC2355MIPI_write_cmos_sensor(pSensorRegData->RegAddr, pSensorRegData->RegData);
-		break;
-		case SENSOR_FEATURE_GET_REGISTER:
-			pSensorRegData->RegData = GC2355MIPI_read_cmos_sensor(pSensorRegData->RegAddr);
-		break;
-		case SENSOR_FEATURE_SET_CCT_REGISTER:
-			memcpy(&GC2355MIPI_sensor.eng.cct, pFeaturePara, sizeof(GC2355MIPI_sensor.eng.cct));
-			break;
-		break;
-		case SENSOR_FEATURE_GET_CCT_REGISTER:	/* 12 */
-			if (*pFeatureParaLen >= sizeof(GC2355MIPI_sensor.eng.cct) + sizeof(kal_uint32))
+		GC2355DB("-------[GC2355SetVideoMode]ZSD???---------\n");
+		if(u2FrameRate==30)
+    		{
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.DummyPixels = 0;//define dummy pixels and lines
+		gc2355.DummyLines = 0 ;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		
+		GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+    		}
+		else
 			{
-			  *((kal_uint32 *)pFeaturePara++) = sizeof(GC2355MIPI_sensor.eng.cct);
-			  memcpy(pFeaturePara, &GC2355MIPI_sensor.eng.cct, sizeof(GC2355MIPI_sensor.eng.cct));
-			}
-			break;
-		case SENSOR_FEATURE_SET_ENG_REGISTER:
-			memcpy(&GC2355MIPI_sensor.eng.reg, pFeaturePara, sizeof(GC2355MIPI_sensor.eng.reg));
-			break;
-		case SENSOR_FEATURE_GET_ENG_REGISTER:	/* 14 */
-			if (*pFeatureParaLen >= sizeof(GC2355MIPI_sensor.eng.reg) + sizeof(kal_uint32))
-			{
-			  *((kal_uint32 *)pFeaturePara++) = sizeof(GC2355MIPI_sensor.eng.reg);
-			  memcpy(pFeaturePara, &GC2355MIPI_sensor.eng.reg, sizeof(GC2355MIPI_sensor.eng.reg));
-			}
-		case SENSOR_FEATURE_GET_REGISTER_DEFAULT:
-			((PNVRAM_SENSOR_DATA_STRUCT)pFeaturePara)->Version = NVRAM_CAMERA_SENSOR_FILE_VERSION;
-			((PNVRAM_SENSOR_DATA_STRUCT)pFeaturePara)->SensorId = GC2355MIPI_SENSOR_ID;
-			memcpy(((PNVRAM_SENSOR_DATA_STRUCT)pFeaturePara)->SensorEngReg, &GC2355MIPI_sensor.eng.reg, sizeof(GC2355MIPI_sensor.eng.reg));
-			memcpy(((PNVRAM_SENSOR_DATA_STRUCT)pFeaturePara)->SensorCCTReg, &GC2355MIPI_sensor.eng.cct, sizeof(GC2355MIPI_sensor.eng.cct));
-			*pFeatureParaLen = sizeof(NVRAM_SENSOR_DATA_STRUCT);
-			break;
-		case SENSOR_FEATURE_GET_CONFIG_PARA:
-			memcpy(pFeaturePara, &GC2355MIPI_sensor.cfg_data, sizeof(GC2355MIPI_sensor.cfg_data));
-			*pFeatureParaLen = sizeof(GC2355MIPI_sensor.cfg_data);
-			break;
-		case SENSOR_FEATURE_CAMERA_PARA_TO_SENSOR:
-		     GC2355MIPI_camera_para_to_sensor();
-			break;
-		case SENSOR_FEATURE_SENSOR_TO_CAMERA_PARA:
-			GC2355MIPI_sensor_to_camera_para();
-			break;							
-		case SENSOR_FEATURE_GET_GROUP_COUNT:
-			GC2355MIPI_get_sensor_group_count((kal_uint32 *)pFeaturePara);
-			*pFeatureParaLen = 4;
-			break;
-		case SENSOR_FEATURE_GET_GROUP_INFO:
-			GC2355MIPI_get_sensor_group_info((MSDK_SENSOR_GROUP_INFO_STRUCT *)pFeaturePara);
-			*pFeatureParaLen = sizeof(MSDK_SENSOR_GROUP_INFO_STRUCT);
-			break;
-		case SENSOR_FEATURE_GET_ITEM_INFO:
-			GC2355MIPI_get_sensor_item_info((MSDK_SENSOR_ITEM_INFO_STRUCT *)pFeaturePara);
-			*pFeatureParaLen = sizeof(MSDK_SENSOR_ITEM_INFO_STRUCT);
-			break;
-		case SENSOR_FEATURE_SET_ITEM_INFO:
-			GC2355MIPI_set_sensor_item_info((MSDK_SENSOR_ITEM_INFO_STRUCT *)pFeaturePara);
-			*pFeatureParaLen = sizeof(MSDK_SENSOR_ITEM_INFO_STRUCT);
-			break;
-		case SENSOR_FEATURE_GET_ENG_INFO:
-			memcpy(pFeaturePara, &GC2355MIPI_sensor.eng_info, sizeof(GC2355MIPI_sensor.eng_info));
-			*pFeatureParaLen = sizeof(GC2355MIPI_sensor.eng_info);
-			break;
-		case SENSOR_FEATURE_GET_LENS_DRIVER_ID:
-			// get the lens driver ID from EEPROM or just return LENS_DRIVER_ID_DO_NOT_CARE
-			// if EEPROM does not exist in camera module.
-			*pFeatureReturnPara32=LENS_DRIVER_ID_DO_NOT_CARE;
-			*pFeatureParaLen=4;
-		break;
-		case SENSOR_FEATURE_SET_VIDEO_MODE:
-		   //GC2355MIPISetVideoMode(*pFeatureData16);
-			break; 
-		case SENSOR_FEATURE_CHECK_SENSOR_ID:
-			GC2355MIPIGetSensorID(pFeatureReturnPara32); 
-			break; 
-		case SENSOR_FEATURE_SET_AUTO_FLICKER_MODE:
-			break;
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.DummyPixels = 0;//define dummy pixels and lines
+		MIN_Frame_length = (GC2355MIPI_VIDEO_CLK)/(GC2355_VIDEO_PERIOD_PIXEL_NUMS + gc2355.DummyPixels)/u2FrameRate;
+		gc2355.DummyLines = MIN_Frame_length - GC2355_VALID_LINE_NUMS-GC2355_DEFAULT_DUMMY_LINE_NUMS;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+		
+		GC2355_SetDummy(gc2355.DummyPixels,gc2355.DummyLines);
+    		}	
+	}
 
-			/*SZ TCT xuejian.zhong add for CTS test */
-		case SENSOR_FEATURE_GET_AF_MAX_NUM_FOCUS_AREAS:
-			GC2355GetAFMaxNumFocusAreas(pFeatureReturnPara32);
+    return KAL_TRUE;
+}
 
-			*pFeatureParaLen=4;
-			break;
+UINT32 GC2355SetAutoFlickerMode(kal_bool bEnable, UINT16 u2FrameRate)
+{
+	//return ERROR_NONE;
+    //GC2355DB("[GC2355SetAutoFlickerMode] frame rate(10base) = %d %d\n", bEnable, u2FrameRate);
+	if(bEnable) {   // enable auto flicker
+		spin_lock(&gc2355mipiraw_drv_lock);
+		gc2355.GC2355AutoFlickerMode = KAL_TRUE;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+    } else {
+    	spin_lock(&gc2355mipiraw_drv_lock);
+        gc2355.GC2355AutoFlickerMode = KAL_FALSE;
+		spin_unlock(&gc2355mipiraw_drv_lock);
+        GC2355DB("Disable Auto flicker\n");
+    }
 
-		case SENSOR_FEATURE_GET_AE_MAX_NUM_METERING_AREAS:
-			GC2355GetAEMaxNumMeteringAreas(pFeatureReturnPara32);
+    return ERROR_NONE;
+}
 
-			*pFeatureParaLen=4;
-			break;
-		case SENSOR_FEATURE_GET_EXIF_INFO:
-
-			GC2355GetExifInfo(*pFeatureReturnPara32);
-			break;
-			/* xuejian.zhong add end */
+UINT32 GC2355SetTestPatternMode(kal_bool bEnable)
+{
+    GC2355DB("[GC2355SetTestPatternMode] Test pattern enable:%d\n", bEnable);
+    if(bEnable)
+    {
+        GC2355_write_cmos_sensor(0x8b,0xb2); //bit[4]: 1 enable test pattern, 0 disable test pattern
+    }
+	else
+	{
+	    GC2355_write_cmos_sensor(0x8b,0xa2);//bit[4]: 1 enable test pattern, 0 disable test pattern
+	}
+    return ERROR_NONE;
+}
 
 
+UINT32 GC2355MIPISetMaxFramerateByScenario(MSDK_SCENARIO_ID_ENUM scenarioId, MUINT32 frameRate) {
+	kal_uint32 pclk;
+	kal_int16 dummyLine;
+	kal_uint16 lineLength,frameHeight;
+		
+	GC2355DB("GC2355MIPISetMaxFramerateByScenario: scenarioId = %d, frame rate = %d\n",scenarioId,frameRate);
+	switch (scenarioId) {
+		case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+			pclk = GC2355MIPI_PREVIEW_CLK;
+			lineLength = GC2355_PV_PERIOD_PIXEL_NUMS;
+			frameHeight = (10 * pclk)/frameRate/lineLength;
+			dummyLine = frameHeight - GC2355_VALID_LINE_NUMS;
+			gc2355.sensorMode = SENSOR_MODE_PREVIEW;
+			GC2355_SetDummy(0, dummyLine);			
+			break;			
+		case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+			pclk = GC2355MIPI_VIDEO_CLK; 
+			lineLength = GC2355_VIDEO_PERIOD_PIXEL_NUMS;
+			frameHeight = (10 * pclk)/frameRate/lineLength;
+			dummyLine = frameHeight - GC2355_VALID_LINE_NUMS;
+			gc2355.sensorMode = SENSOR_MODE_VIDEO;
+			GC2355_SetDummy(0, dummyLine);			
+			break;			
+			 break;
+		case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+		case MSDK_SCENARIO_ID_CAMERA_ZSD:			
+			pclk = GC2355MIPI_CAPTURE_CLK;
+			lineLength = GC2355_FULL_PERIOD_PIXEL_NUMS;
+			frameHeight = (10 * pclk)/frameRate/lineLength;
+			dummyLine = frameHeight - GC2355_VALID_LINE_NUMS;
+			gc2355.sensorMode = SENSOR_MODE_CAPTURE;
+			GC2355_SetDummy(0, dummyLine);			
+			break;		
+        case MSDK_SCENARIO_ID_CAMERA_3D_PREVIEW: //added
+            break;
+        case MSDK_SCENARIO_ID_CAMERA_3D_VIDEO:
+			break;
+        case MSDK_SCENARIO_ID_CAMERA_3D_CAPTURE: //added   
+			break;		
+		default:
+			break;
+	}	
+	return ERROR_NONE;
+}
 
+
+UINT32 GC2355MIPIGetDefaultFramerateByScenario(MSDK_SCENARIO_ID_ENUM scenarioId, MUINT32 *pframeRate) 
+{
+
+	switch (scenarioId) {
+		case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+		case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+			 *pframeRate = 300;
+			 break;
+		case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+		case MSDK_SCENARIO_ID_CAMERA_ZSD:
+			 *pframeRate = 300;
+			break;		
+        case MSDK_SCENARIO_ID_CAMERA_3D_PREVIEW: //added
+        case MSDK_SCENARIO_ID_CAMERA_3D_VIDEO:
+        case MSDK_SCENARIO_ID_CAMERA_3D_CAPTURE: //added   
+			 *pframeRate = 300;
+			break;		
 		default:
 			break;
 	}
+
 	return ERROR_NONE;
-}	/* GC2355MIPIFeatureControl() */
-SENSOR_FUNCTION_STRUCT	SensorFuncGC2355MIPI=
+}
+
+
+UINT32 GC2355FeatureControl(MSDK_SENSOR_FEATURE_ENUM FeatureId,
+                                                                UINT8 *pFeaturePara,UINT32 *pFeatureParaLen)
 {
-	GC2355MIPIOpen,
-	GC2355MIPIGetInfo,
-	GC2355MIPIGetResolution,
-	GC2355MIPIFeatureControl,
-	GC2355MIPIControl,
-	GC2355MIPIClose
+    UINT16 *pFeatureReturnPara16=(UINT16 *) pFeaturePara;
+    UINT16 *pFeatureData16=(UINT16 *) pFeaturePara;
+    UINT32 *pFeatureReturnPara32=(UINT32 *) pFeaturePara;
+    UINT32 *pFeatureData32=(UINT32 *) pFeaturePara;
+    UINT32 SensorRegNumber;
+    UINT32 i;
+    PNVRAM_SENSOR_DATA_STRUCT pSensorDefaultData=(PNVRAM_SENSOR_DATA_STRUCT) pFeaturePara;
+    MSDK_SENSOR_CONFIG_STRUCT *pSensorConfigData=(MSDK_SENSOR_CONFIG_STRUCT *) pFeaturePara;
+    MSDK_SENSOR_REG_INFO_STRUCT *pSensorRegData=(MSDK_SENSOR_REG_INFO_STRUCT *) pFeaturePara;
+    MSDK_SENSOR_GROUP_INFO_STRUCT *pSensorGroupInfo=(MSDK_SENSOR_GROUP_INFO_STRUCT *) pFeaturePara;
+    MSDK_SENSOR_ITEM_INFO_STRUCT *pSensorItemInfo=(MSDK_SENSOR_ITEM_INFO_STRUCT *) pFeaturePara;
+    MSDK_SENSOR_ENG_INFO_STRUCT	*pSensorEngInfo=(MSDK_SENSOR_ENG_INFO_STRUCT *) pFeaturePara;
+
+    switch (FeatureId)
+    {
+        case SENSOR_FEATURE_GET_RESOLUTION:
+            *pFeatureReturnPara16++= GC2355_IMAGE_SENSOR_FULL_WIDTH;
+            *pFeatureReturnPara16= GC2355_IMAGE_SENSOR_FULL_HEIGHT;
+            *pFeatureParaLen=4;
+            break;
+        case SENSOR_FEATURE_GET_PERIOD:
+				*pFeatureReturnPara16++= GC2355_FeatureControl_PERIOD_PixelNum;
+				*pFeatureReturnPara16= GC2355_FeatureControl_PERIOD_LineNum;
+				*pFeatureParaLen=4;
+				break;
+        case SENSOR_FEATURE_GET_PIXEL_CLOCK_FREQ:
+			switch(GC2355CurrentScenarioId)
+			{
+				case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+					*pFeatureReturnPara32 = GC2355MIPI_PREVIEW_CLK;
+					*pFeatureParaLen=4;
+					break;
+				case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+					*pFeatureReturnPara32 = GC2355MIPI_VIDEO_CLK;
+					*pFeatureParaLen=4;
+					break;
+				case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+				case MSDK_SCENARIO_ID_CAMERA_ZSD:
+					*pFeatureReturnPara32 = GC2355MIPI_CAPTURE_CLK;
+					*pFeatureParaLen=4;
+					break;
+				default:
+					*pFeatureReturnPara32 = GC2355MIPI_CAPTURE_CLK;
+					*pFeatureParaLen=4;
+					break;
+			}
+		      break;
+
+        case SENSOR_FEATURE_SET_ESHUTTER:
+            GC2355_SetShutter(*pFeatureData16);
+            break;
+        case SENSOR_FEATURE_SET_NIGHTMODE:
+            GC2355_NightMode((BOOL) *pFeatureData16);
+            break;
+        case SENSOR_FEATURE_SET_GAIN:
+            GC2355_SetGain((UINT16) *pFeatureData16);
+            break;
+        case SENSOR_FEATURE_SET_FLASHLIGHT:
+            break;
+        case SENSOR_FEATURE_SET_ISP_MASTER_CLOCK_FREQ:
+            //GC2355_isp_master_clock=*pFeatureData32;
+            break;
+        case SENSOR_FEATURE_SET_REGISTER:
+            GC2355_write_cmos_sensor(pSensorRegData->RegAddr, pSensorRegData->RegData);
+            break;
+        case SENSOR_FEATURE_GET_REGISTER:
+            pSensorRegData->RegData = GC2355_read_cmos_sensor(pSensorRegData->RegAddr);
+            break;
+        case SENSOR_FEATURE_SET_CCT_REGISTER:
+            SensorRegNumber=FACTORY_END_ADDR;
+            for (i=0;i<SensorRegNumber;i++)
+            {
+            	spin_lock(&gc2355mipiraw_drv_lock);
+                GC2355SensorCCT[i].Addr=*pFeatureData32++;
+                GC2355SensorCCT[i].Para=*pFeatureData32++;
+				spin_unlock(&gc2355mipiraw_drv_lock);
+            }
+            break;
+        case SENSOR_FEATURE_GET_CCT_REGISTER:
+            SensorRegNumber=FACTORY_END_ADDR;
+            if (*pFeatureParaLen<(SensorRegNumber*sizeof(SENSOR_REG_STRUCT)+4))
+                return FALSE;
+            *pFeatureData32++=SensorRegNumber;
+            for (i=0;i<SensorRegNumber;i++)
+            {
+                *pFeatureData32++=GC2355SensorCCT[i].Addr;
+                *pFeatureData32++=GC2355SensorCCT[i].Para;
+            }
+            break;
+        case SENSOR_FEATURE_SET_ENG_REGISTER:
+            SensorRegNumber=ENGINEER_END;
+            for (i=0;i<SensorRegNumber;i++)
+            {
+            	spin_lock(&gc2355mipiraw_drv_lock);
+                GC2355SensorReg[i].Addr=*pFeatureData32++;
+                GC2355SensorReg[i].Para=*pFeatureData32++;
+				spin_unlock(&gc2355mipiraw_drv_lock);
+            }
+            break;
+        case SENSOR_FEATURE_GET_ENG_REGISTER:
+            SensorRegNumber=ENGINEER_END;
+            if (*pFeatureParaLen<(SensorRegNumber*sizeof(SENSOR_REG_STRUCT)+4))
+                return FALSE;
+            *pFeatureData32++=SensorRegNumber;
+            for (i=0;i<SensorRegNumber;i++)
+            {
+                *pFeatureData32++=GC2355SensorReg[i].Addr;
+                *pFeatureData32++=GC2355SensorReg[i].Para;
+            }
+            break;
+        case SENSOR_FEATURE_GET_REGISTER_DEFAULT:
+            if (*pFeatureParaLen>=sizeof(NVRAM_SENSOR_DATA_STRUCT))
+            {
+                pSensorDefaultData->Version=NVRAM_CAMERA_SENSOR_FILE_VERSION;
+                pSensorDefaultData->SensorId=GC2355MIPI_SENSOR_ID;
+                memcpy(pSensorDefaultData->SensorEngReg, GC2355SensorReg, sizeof(SENSOR_REG_STRUCT)*ENGINEER_END);
+                memcpy(pSensorDefaultData->SensorCCTReg, GC2355SensorCCT, sizeof(SENSOR_REG_STRUCT)*FACTORY_END_ADDR);
+            }
+            else
+                return FALSE;
+            *pFeatureParaLen=sizeof(NVRAM_SENSOR_DATA_STRUCT);
+            break;
+        case SENSOR_FEATURE_GET_CONFIG_PARA:
+            memcpy(pSensorConfigData, &GC2355SensorConfigData, sizeof(MSDK_SENSOR_CONFIG_STRUCT));
+            *pFeatureParaLen=sizeof(MSDK_SENSOR_CONFIG_STRUCT);
+            break;
+        case SENSOR_FEATURE_CAMERA_PARA_TO_SENSOR:
+            GC2355_camera_para_to_sensor();
+            break;
+
+        case SENSOR_FEATURE_SENSOR_TO_CAMERA_PARA:
+            GC2355_sensor_to_camera_para();
+            break;
+        case SENSOR_FEATURE_GET_GROUP_COUNT:
+            *pFeatureReturnPara32++=GC2355_get_sensor_group_count();
+            *pFeatureParaLen=4;
+            break;
+        case SENSOR_FEATURE_GET_GROUP_INFO:
+            GC2355_get_sensor_group_info(pSensorGroupInfo->GroupIdx, pSensorGroupInfo->GroupNamePtr, &pSensorGroupInfo->ItemCount);
+            *pFeatureParaLen=sizeof(MSDK_SENSOR_GROUP_INFO_STRUCT);
+            break;
+        case SENSOR_FEATURE_GET_ITEM_INFO:
+            GC2355_get_sensor_item_info(pSensorItemInfo->GroupIdx,pSensorItemInfo->ItemIdx, pSensorItemInfo);
+            *pFeatureParaLen=sizeof(MSDK_SENSOR_ITEM_INFO_STRUCT);
+            break;
+
+        case SENSOR_FEATURE_SET_ITEM_INFO:
+            GC2355_set_sensor_item_info(pSensorItemInfo->GroupIdx, pSensorItemInfo->ItemIdx, pSensorItemInfo->ItemValue);
+            *pFeatureParaLen=sizeof(MSDK_SENSOR_ITEM_INFO_STRUCT);
+            break;
+
+        case SENSOR_FEATURE_GET_ENG_INFO:
+            pSensorEngInfo->SensorId = 129;
+            pSensorEngInfo->SensorType = CMOS_SENSOR;
+            pSensorEngInfo->SensorOutputDataFormat=SENSOR_OUTPUT_FORMAT_RAW_R;
+            *pFeatureParaLen=sizeof(MSDK_SENSOR_ENG_INFO_STRUCT);
+            break;
+        case SENSOR_FEATURE_GET_LENS_DRIVER_ID:
+            // get the lens driver ID from EEPROM or just return LENS_DRIVER_ID_DO_NOT_CARE
+            // if EEPROM does not exist in camera module.
+            *pFeatureReturnPara32=LENS_DRIVER_ID_DO_NOT_CARE;
+            *pFeatureParaLen=4;
+            break;
+
+        case SENSOR_FEATURE_INITIALIZE_AF:
+            break;
+        case SENSOR_FEATURE_CONSTANT_AF:
+            break;
+        case SENSOR_FEATURE_MOVE_FOCUS_LENS:
+            break;
+        case SENSOR_FEATURE_SET_VIDEO_MODE:
+            GC2355SetVideoMode(*pFeatureData16);
+            break;
+        case SENSOR_FEATURE_CHECK_SENSOR_ID:
+            GC2355GetSensorID(pFeatureReturnPara32);
+            break;
+        case SENSOR_FEATURE_SET_AUTO_FLICKER_MODE:
+            GC2355SetAutoFlickerMode((BOOL)*pFeatureData16, *(pFeatureData16+1));
+	        break;
+        case SENSOR_FEATURE_SET_TEST_PATTERN:
+            GC2355SetTestPatternMode((BOOL)*pFeatureData16);
+            break;
+	    case SENSOR_FEATURE_GET_TEST_PATTERN_CHECKSUM_VALUE:
+			*pFeatureReturnPara32=GC2355_TEST_PATTERN_CHECKSUM;
+			*pFeatureParaLen=4;
+			break;
+		case SENSOR_FEATURE_SET_MAX_FRAME_RATE_BY_SCENARIO:
+			GC2355MIPISetMaxFramerateByScenario((MSDK_SCENARIO_ID_ENUM)*pFeatureData32, *(pFeatureData32+1));
+			break;
+		case SENSOR_FEATURE_GET_DEFAULT_FRAME_RATE_BY_SCENARIO:
+			GC2355MIPIGetDefaultFramerateByScenario((MSDK_SCENARIO_ID_ENUM)*pFeatureData32, (MUINT32 *)(*(pFeatureData32+1)));
+			break;
+        default:
+            break;
+    }
+    return ERROR_NONE;
+}	/* GC2355FeatureControl() */
+
+
+SENSOR_FUNCTION_STRUCT	SensorFuncGC2355=
+{
+    GC2355Open,
+    GC2355GetInfo,
+    GC2355GetResolution,
+    GC2355FeatureControl,
+    GC2355Control,
+    GC2355Close
 };
 
-UINT32 GC2355MIPI_RAW_SensorInit(PSENSOR_FUNCTION_STRUCT *pfFunc) 
+UINT32 GC2355MIPI_RAW_SensorInit(PSENSOR_FUNCTION_STRUCT *pfFunc)
 {
-	/* To Do : Check Sensor status here */
-	if (pfFunc!=NULL)
-		*pfFunc=&SensorFuncGC2355MIPI;
+    /* To Do : Check Sensor status here */
+    if (pfFunc!=NULL)
+        *pfFunc=&SensorFuncGC2355;
 
-	return ERROR_NONE;
-}	/* SensorInit() */
+    return ERROR_NONE;
+}   /* SensorInit() */
